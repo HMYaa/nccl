@@ -2,3 +2,10 @@
 /build
 *.gcov
 /coverage/
+/.cache
+.clangd
+/.vscode
+compile_commands.json
+/.cursor
+/.claude
+.clang-format

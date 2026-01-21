@@ -372,6 +372,7 @@ static ncclResult_t SaveProxy(struct ncclChannel* channel, int type, int peer, s
 
 // justInquire != nullptr means don't actually do anything, just assertain need of
 // ncclProxySaveOp for this op.
+// 【数据面-第一次读】Ring/Pipeline 分支：AllReduce+Ring+Simple 第一次跟读必看；下面 Tree、CollNet、Send/Recv 可标【数据面-可后看】
 ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool* justInquire) {
   struct ncclChannel* channel = &comm->channels[op->channelId];
   if (justInquire) *justInquire = false;
@@ -379,7 +380,7 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
   case ncclPatternRing:
   case ncclPatternRingTwice:
   case ncclPatternPipelineFrom:
-  case ncclPatternPipelineTo: {
+  case ncclPatternPipelineTo: {  // 【数据面-第一次读】Ring 相关 pattern，先看这里
       struct ncclRing* ring = &channel->ring;
       if (NeedProxy(proxyRecv, op->pattern, op->root, ring, comm->nRanks)) {
         NCCLCHECK(SaveProxy(channel, proxyRecv, ring->prev, op, 0, justInquire));
@@ -390,7 +391,7 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
     } break;
   case ncclPatternTreeUp:
   case ncclPatternTreeDown:
-  case ncclPatternTreeUpDown: {
+  case ncclPatternTreeUpDown: {  // 【数据面-可后看】Tree 算法
       if (op->pattern != ncclPatternTreeDown) { // Tree up
         struct ncclTree* tree = &channel->tree;
         for (int i=0; i<NCCL_MAX_TREE_ARITY; i++) {
@@ -406,16 +407,16 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
         NCCLCHECK(SaveProxy(channel, proxyRecv, tree->up, op, 0, justInquire));
       }
     } break;
-  case ncclPatternCollnetChain: {
+  case ncclPatternCollnetChain: {  // 【数据面-可后看】CollNet
       NCCLCHECK(SaveProxy(channel, proxySend, channel->collnetChain.up, op, 1, justInquire));
       NCCLCHECK(SaveProxy(channel, proxyRecv, channel->collnetChain.up, op, 0, justInquire));
     } break;
-  case ncclPatternCollnetDirect: {
+  case ncclPatternCollnetDirect: {  // 【数据面-可后看】CollNet
       NCCLCHECK(SaveProxy(channel, proxySend, channel->collnetDirect.out, op, 1, justInquire));
       NCCLCHECK(SaveProxy(channel, proxyRecv, channel->collnetDirect.out, op, 0, justInquire));
     } break;
   case ncclPatternSend:
-  case ncclPatternRecv: {
+  case ncclPatternRecv: {  // 【数据面-可后看】P2P Send/Recv
       if (op->root == comm->rank) return ncclSuccess;
       NCCLCHECK(SaveProxy(channel, op->pattern == ncclPatternSend ? proxySend : proxyRecv, op->root, op, 1, justInquire));
     } break;
@@ -425,6 +426,7 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
 
 NCCL_PARAM(ChunkSize, "CHUNK_SIZE", 0);
 
+// 【数据面-可后看】P2P 的 proxyOp 计算，第一遍跟读可跳过
 ncclResult_t ncclProxyComputeP2p(struct ncclInfo* info, struct ncclProxyOp* op) {
   memset(op, 0, sizeof(struct ncclProxyOp));
   int channelId = info->channelId;
@@ -511,6 +513,7 @@ static ncclResult_t removeOp(struct ncclProxyProgressState* state, struct ncclPr
   return ncclSuccess;
 }
 
+// 【数据面-第一次读】Proxy 消费 op，对每个 op 调用 progress；progress 会调到 net 的 sendProxyProgress/recvProxyProgress，进而 ncclNetIsend/ncclNetIrecv -> ncclIbIsend/ibv_post_send
 static ncclResult_t progressOps(struct ncclComm* comm, struct ncclProxyProgressState* state, struct ncclProxyArgs* opStart, int* idle) {
   struct ncclProxyArgs* prevOp = NULL;
   struct ncclProxyArgs* op = opStart;
@@ -564,6 +567,7 @@ static ncclResult_t ncclProxyGetPostedOps(struct ncclComm* comm, int* added) {
   if (state->nextOps == -1) return ncclInternalError;
 
 process_nextops:
+  // 【数据面-第一次读】下方循环：从 pool 取 peerOp，ProxyAppend 加入 state->active，供 progressOps 消费并调 net
   ncclProfilingRecord(&profArgs, 0, 0, ncclProxyProfileAppend);
   TIME_START(2);
   int freeOp[NCCL_MAX_LOCAL_RANKS];
@@ -656,6 +660,7 @@ ncclResult_t ncclSetThreadContext(struct ncclComm* comm) {
 // Set to SIGUSR1 or SIGUSR2 to help debug proxy state during hangs
 NCCL_PARAM(ProxyDumpSignal, "PROXY_DUMP_SIGNAL", -1);
 
+// 【数据面-第一次读】Proxy 主循环：progressOps 消费 state->active 里的 op，idle 时 ncclProxyGetPostedOps 拉取新 op；op->progress 最终会调 net 的 ncclNetIsend/ncclNetIrecv
 void* ncclProxyProgress(void *comm_) {
   struct ncclComm* comm = (struct ncclComm*)comm_;
   if (ncclSetThreadContext(comm) != ncclSuccess) {
@@ -678,7 +683,7 @@ void* ncclProxyProgress(void *comm_) {
   struct ncclProxyArgs profArgs; // Only used for profiling purposes
   while (state->stop == 0 && *comm->abortFlag == 0) {
     int idle = 1;
-    ncclResult_t ret = progressOps(comm, state, state->active, &idle);
+    ncclResult_t ret = progressOps(comm, state, state->active, &idle);  // 【数据面-第一次读】对 active 链上的每个 op 调 progress -> net
     if (ret != ncclSuccess) {
       (void) ncclCommSetAsyncError(comm, ret);
       INFO(NCCL_ALL,"%s:%d -> %d [Proxy Thread]", __FILE__, __LINE__, ret);

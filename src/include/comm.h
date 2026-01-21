@@ -97,11 +97,11 @@ struct ncclCommCallback {
 };
 
 struct ncclChannel {
-  struct ncclChannelPeer* peers;
+  struct ncclChannelPeer* peers; // 对等节点
   struct ncclDevChannelPeer* devPeers;
-  struct ncclRing ring;
+  struct ncclRing ring;  // ring 拓扑
   int* devRingUserRanks;
-  struct ncclTree tree;
+  struct ncclTree tree;  // tree拓扑
   struct ncclTree collnetChain;
   struct ncclDirect collnetDirect;
   int id; // index of this channel

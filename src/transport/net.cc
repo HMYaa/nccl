@@ -806,6 +806,7 @@ static ncclResult_t recvProxyFree(struct ncclProxyConnection* connection, struct
 
 static_assert(NCCL_STEPS <= NCCL_NET_MAX_REQUESTS, "Not enough net requests to cover for steps");
 
+// 【数据面-第一次读】NET 的 send Proxy：轮询 GPU 的 sizesFifo，数据就绪后 ncclNetIsend -> ncclIbIsend -> ibv_post_send
 static ncclResult_t sendProxyProgress(struct ncclComm* comm, struct ncclProxyArgs* args) {
   if (args->state == ncclProxyOpReady) {
     for (int s=0; s<args->nsubs; s++) {
@@ -862,7 +863,7 @@ static ncclResult_t sendProxyProgress(struct ncclComm* comm, struct ncclProxyArg
           bool shared = (p == NCCL_PROTO_SIMPLE) && resources->shared;
           char* buff = shared ? localBuff+resources->recvMem->offsFifo[buffSlot] : localBuff+buffSlot*stepSize;
           int ready = 1;
-          if (p == NCCL_PROTO_LL128) {
+          if (p == NCCL_PROTO_LL128) {  // 【数据面-可后看】LL128 协议的就绪判断
             ready = resources->useGdr;
             if (!ready) {
               // When data is in sysmem, we need to wait until all flags are correct since the GPU only
@@ -875,7 +876,7 @@ static ncclResult_t sendProxyProgress(struct ncclComm* comm, struct ncclProxyArg
                 if (lines[i*NCCL_LL128_LINEELEMS+NCCL_LL128_DATAELEMS] != flag) { ready = 0; break; }
               }
             }
-          } else if (p == NCCL_PROTO_LL) {
+          } else if (p == NCCL_PROTO_LL) {  // 【数据面-可后看】LL 协议的就绪判断
             uint32_t flag = NCCL_LL_FLAG(sub->base+sub->transmitted+1);
             int nFifoLines = DIVUP(size, sizeof(union ncclLLFifoLine));
             union ncclLLFifoLine* lines = (union ncclLLFifoLine*)buff;
@@ -887,7 +888,7 @@ static ncclResult_t sendProxyProgress(struct ncclComm* comm, struct ncclProxyArg
           }
           if (ready) {
             // Data is ready, try to send.
-            NCCLCHECK(ncclNetIsend(comm, resources->netSendComm, buff, size, resources->rank, mhandle, sub->requests+buffSlot));
+            NCCLCHECK(ncclNetIsend(comm, resources->netSendComm, buff, size, resources->rank, mhandle, sub->requests+buffSlot));  // 【数据面-第一次读】-> ncclIbIsend -> ibv_post_send
             if (sub->requests[buffSlot] != NULL) {
               TRACE(NCCL_NET, "sendProxy [%ld/%d] Isend posted, req %p", sub->transmitted, buffSlot, sub->requests[buffSlot]);
               sizesFifo[buffSlot] = -1;
@@ -931,6 +932,7 @@ static ncclResult_t sendProxyProgress(struct ncclComm* comm, struct ncclProxyArg
   return ncclSuccess;
 }
 
+// 【数据面-第一次读】NET 的 recv Proxy：ncclNetIrecv 拉取数据，ncclNetTest 等完成，再更新 tail 通知 GPU
 static ncclResult_t recvProxyProgress(struct ncclComm* comm, struct ncclProxyArgs* args) {
   if (args->state == ncclProxyOpReady) {
     // Initialize subs and group them by same recvComm.
@@ -1009,7 +1011,7 @@ static ncclResult_t recvProxyProgress(struct ncclComm* comm, struct ncclProxyArg
         uint64_t step = subGroup->posted;
         struct recvResources* resources = (struct recvResources*) (subGroup->connection->transportResources);
         void** requestPtr = subGroup->requests+(step%NCCL_STEPS);
-        NCCLCHECK(ncclNetIrecv(comm, resources->netRecvComm, subCount, ptrs, sizes, tags, mhandles, requestPtr));
+        NCCLCHECK(ncclNetIrecv(comm, resources->netRecvComm, subCount, ptrs, sizes, tags, mhandles, requestPtr));  // 【数据面-第一次读】-> ncclIbIrecv -> ibv_post_recv + PostFifo
         if (*requestPtr) {
           for (int i=0; i<subGroup->groupSize; i++) {
             struct ncclProxySubArgs* sub = subGroup+i;
@@ -1046,7 +1048,7 @@ static ncclResult_t recvProxyProgress(struct ncclComm* comm, struct ncclProxyArg
             }
           }
           subGroup->requests[step%NCCL_STEPS] = NULL;
-          if (totalSize > 0 && p == NCCL_PROTO_SIMPLE && useGdr) {
+          if (totalSize > 0 && p == NCCL_PROTO_SIMPLE && useGdr) {  // 【数据面-可后看】GDR 收完后 Flush
             // GDRCOPY support
             struct recvResources* resources = (struct recvResources*) (subGroup->connection->transportResources);
             if (resources->gdcFlush) {

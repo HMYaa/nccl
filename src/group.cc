@@ -122,18 +122,27 @@ ncclResult_t ncclPreconnectFunc(struct ncclAsyncJob* job_) {
   return ncclSuccess;
 }
 
+/**
+ * doLaunches: 对「有待做任务的 comm 链表」执行 ncclLaunchPrepare -> 循环 (LaunchBefore/Launch/LaunchAfter) -> ncclLaunchFinish
+ *
+ * 按 clique 迭代：clique = 所有 intraComm0 相同的 comm（同一进程内、同一「全局实体」的一组分身）。
+ * 对每个 clique：
+ *   - 先对 clique 内每个 comm 调 ncclLaunchPrepare(comm)，把 tasks 变成 unlaunchedPlansHead；
+ *   - 若 useBarrier，做 ncclCommIntraBarrierIn，以便多进程间同步「每人都有几轮 plan」；
+ *   - 循环「轮次」：每轮对 clique 内每个 comm 从 unlaunchedPlansHead 弹一个 plan，
+ *     LaunchBefore(uploadWork) -> LaunchKernel -> LaunchAfter(hostStreamPlanTask 等)；若无 plan 则 ncclLaunchFinish。
+ * 这样保证：同一 clique 内多 comm 的 Kernel 发射顺序、与 Proxy 的配合，在多进程下一致。
+ */
 static ncclResult_t doLaunches(struct ncclComm* head) {
   ncclResult_t result = ncclSuccess;
   struct ncclComm* cliqueComm0 = head->intraComm0;
   struct ncclComm* cliqueHead = head;
   struct ncclComm* cliqueNextHead;
   bool useBarrier = ncclParamLaunchMode == ncclLaunchModeGroup;
-  // This outer loop iterates over cliques of comms which are siblings of the
-  // same global entity. We calculate a clique as all comms which have the same
-  // `intraComm0` value.
   do {
     struct ncclComm* comm = cliqueHead;
     bool capturingYes = false, capturingNo = false;
+    // 同一 clique 内：每个 comm 先 Prepare，把 tasks 转成 unlaunchedPlansHead
     do {
       (ncclCudaGraphValid(comm->tasks.capturingGraph) ? capturingYes : capturingNo) = true;
       CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
@@ -144,40 +153,35 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
     cliqueNextHead = comm;
 
     if (capturingYes && capturingNo) {
-      // We have entered barriers but are aborting without leaving them. Thus
-      // these comms are permanently trashed. We need a good mechanism for
-      // tracking and reporting that.
       WARN("Either none or all communicators in a ncclGroup() can be CUDA graph captured.");
       result = ncclInvalidUsage;
       goto failure;
     }
 
-    while (true) { // Iterate rounds of launches for clique.
+    // 多轮发射：每轮每个 comm 弹一个 plan 做 LaunchBefore/Launch/LaunchAfter，或做 LaunchFinish
+    while (true) {
       bool moreRounds;
       comm = cliqueHead;
-      do { // Iterate clique members.
+      do {
         struct ncclComm* next = comm->groupNext;
         if (useBarrier) {
-          // Barrier reduction result tells us if this was the final round.
           moreRounds = 0 != ncclCommIntraBarrierOut(comm);
         } else {
           moreRounds = comm->unlaunchedPlansHead != nullptr;
         }
         if (moreRounds) {
-          // Pop next unlaunched kernel
           struct ncclKernelPlan* plan = comm->unlaunchedPlansHead;
           if (plan != nullptr) {
             comm->unlaunchedPlansHead = plan->next;
             CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
-            NCCLCHECKGOTO(ncclLaunchKernelBefore_NoUncapturedCuda(comm, plan), result, failure);
+            NCCLCHECKGOTO(ncclLaunchKernelBefore_NoUncapturedCuda(comm, plan), result, failure);  // uploadWork
             NCCLCHECKGOTO(ncclLaunchKernel(comm, plan), result, failure);
           }
-          // Barrier reduction input indicates if we require further rounds.
           if (useBarrier) ncclCommIntraBarrierIn(comm, comm->unlaunchedPlansHead != nullptr ? 1 : 0);
           if (plan != nullptr) {
-            NCCLCHECKGOTO(ncclLaunchKernelAfter_NoCuda(comm, plan), result, failure);
+            NCCLCHECKGOTO(ncclLaunchKernelAfter_NoCuda(comm, plan), result, failure);  // 非 persistent 时 hostStreamPlanTask
           }
-        } else { // Final round.
+        } else {
           CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
           NCCLCHECKGOTO(ncclLaunchFinish(comm), result, failure);
         }
@@ -263,6 +267,16 @@ static void groupCleanup(struct ncclComm** groupCommHeadPtr, struct ncclComm** g
   return;
 }
 
+/**
+ * groupLaunch: ncclGroupEnd 深度变为 0 时触发的「组执行」入口
+ *
+ * 流程：1) 若有 preconnect 链表，为每个 comm 创建 ncclPreconnectJob 入 asyncJobs，并 pthread 跑完；
+ *      2) 若有其它 async 任务（如 ncclCommInitRank 的 job），pthread 创建并等全部 Done；
+ *      3) 若有 groupCommHead，调 doLaunches(groupCommHead) 对 comm 链做 Prepare -> 循环 Launch* -> Finish；
+ *      4) 置 doneFlag，清 async 队列、groupCommHead、groupCommPreconnectHead，并 GroupCommLeave。
+ * 阻塞/非阻塞：由 ncclGroupEndInternal 根据 ncclGroupBlocking、是否有 preconnect/async 决定
+ *             是直接调 groupLaunch 还是起线程跑 groupLaunch。
+ */
 static ncclResult_t groupLaunch(struct ncclAsyncJob *job_) {
   int savedDev;
   ncclResult_t ret = ncclSuccess;
@@ -276,6 +290,7 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_) {
 
   CUDACHECKGOTO(cudaGetDevice(&savedDev), ret, fail);
 
+  // 若有 preconnect：为每个 comm 建 PreconnectJob 并入 async 队列，后面统一 pthread 跑
   if (groupCommPreconnectHeadMain != nullptr) {
     struct ncclComm* comm = groupCommPreconnectHeadMain;
     do {
@@ -295,6 +310,7 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_) {
     } while (comm != nullptr);
   }
 
+  // 跑完所有 async 任务（preconnect、commInit 等）
   if (!ncclIntruQueueEmpty(asyncJobsMain)) {
     struct ncclAsyncJob* job = ncclIntruQueueHead(asyncJobsMain);
     do {
@@ -336,12 +352,12 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_) {
     if (ret != ncclSuccess) goto fail;
   }
 
+  // 对待做任务的 comm 链表执行：ncclLaunchPrepare -> 循环 Launch* -> ncclLaunchFinish
   if (groupCommHeadMain != nullptr) {
     NCCLCHECKGOTO(doLaunches(groupCommHeadMain), ret, fail);
   }
 
-  /* this atomic must happen before cleanup and setting state of communicators */
-  __atomic_store_n(&gjob->doneFlag, true, __ATOMIC_RELEASE);
+  __atomic_store_n(&gjob->doneFlag, true, __ATOMIC_RELEASE);  // 必须在清理和设置 comm 状态之前
 
   while (!ncclIntruQueueEmpty(asyncJobsMain)) {
     struct ncclAsyncJob* job = ncclIntruQueueDequeue(asyncJobsMain);
@@ -373,6 +389,17 @@ fail:
   goto exit;
 }
 
+/**
+ * ncclGroupEndInternal: Group 深度减 1；当深度从 1 变为 0 时，触发本「组」的执行（groupLaunch）
+ *
+ * 深度>0：仅减深度后返回。
+ * 深度变为 0：若无 groupCommHead 且无 async 且无 preconnect，直接返回；
+ *            否则填充 ncclGroupJobMain，根据 blocking 与是否有 preconnect/async：
+ *            - 非阻塞且 (preconnect 非空 或 async 非空)：起 pthread 跑 groupLaunch，返回 ncclInProgress；
+ *            - 其它：本线程直接 groupLaunch，再 groupResetJobState。
+ * 这样：单次 ncclAllReduce 时，ncclEnqueueCheck 里 GroupStart(深度=1) -> taskAppend -> GroupEnd(深度=0)
+ *      会在这里触发 groupLaunch -> doLaunches -> ncclLaunchPrepare -> ncclLaunchKernel。
+ */
 ncclResult_t ncclGroupEndInternal() {
   ncclResult_t ret = ncclSuccess;
 
@@ -382,7 +409,7 @@ ncclResult_t ncclGroupEndInternal() {
     goto exit;
   }
 
-  if ((--ncclGroupDepth) > 0) goto exit;
+  if ((--ncclGroupDepth) > 0) goto exit;  // 深度仍>0，只减深度
 
   if ((ret = ncclGroupError) != ncclSuccess) goto fail;
 
@@ -394,10 +421,9 @@ ncclResult_t ncclGroupEndInternal() {
     ncclGroupJobMain.abortFlagPtr = &ncclGroupJobAbortFlag;
     ncclGroupJobMain.doneFlag = false;
     ncclGroupJobMainPtr = &ncclGroupJobMain;
-    /* make sure ncclGroupBlocking has been set. */
     assert(ncclGroupBlocking == 0 || ncclGroupBlocking == 1);
+    // 非阻塞 且 需要 preconnect 或 有 async 任务：起线程跑 groupLaunch，先返回 ncclInProgress
     if (ncclGroupBlocking == 0 && (ncclGroupCommPreconnectHead != nullptr || !ncclIntruQueueEmpty(&ncclAsyncJobs))) {
-      /* nonblocking group */
       if (!ncclIntruQueueEmpty(&ncclAsyncJobs)) {
         ncclAsyncJob* job = ncclIntruQueueHead(&ncclAsyncJobs);
         do {
@@ -417,8 +443,7 @@ ncclResult_t ncclGroupEndInternal() {
       SYSCHECKGOTO(pthread_create(&ncclGroupJobMainPtr->base.thread, NULL, ncclAsyncJobMain, (void*)&ncclGroupJobMainPtr->base), ret, fail);
       ret = ncclInProgress;
     } else {
-      /* blocking group */
-      NCCLCHECKGOTO(groupLaunch(&ncclGroupJobMainPtr->base), ret, fail);
+      NCCLCHECKGOTO(groupLaunch(&ncclGroupJobMainPtr->base), ret, fail);  // 阻塞：本线程直接执行
       groupResetJobState();
     }
   }

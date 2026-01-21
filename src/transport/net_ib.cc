@@ -119,16 +119,43 @@ static ncclResult_t ncclIbGetPciPath(char* devName, char** path, int* realPort) 
   return ncclSuccess;
 }
 
+/**
+ * 【网卡速度计算辅助函数】
+ * 
+ * IB Verbs API 返回的 width 和 speed 是位掩码，需要转换为实际数值
+ */
+
+// IB Verbs 定义的链路宽度（单位：lanes）
+// 对应 IBV_WIDTH_1X, IBV_WIDTH_4X, IBV_WIDTH_8X, IBV_WIDTH_12X, IBV_WIDTH_2X
 static int ibvWidths[] = { 1, 4, 8, 12, 2 };
+// IB Verbs 定义的速度（单位：Mbps per lane）
+// 对应 SDR(2.5G), DDR(5G), QDR(10G), FDR10(10G), FDR(14G), EDR(25G), HDR(50G)
 static int ibvSpeeds[] = { 2500, 5000, 10000, 10000, 14000, 25000, 50000 };
+
+/**
+ * 查找位掩码中第一个设置的位
+ * @param val: 位掩码值
+ * @param max: 最大位数
+ * @return: 第一个设置的位的索引
+ */
 static int firstBitSet(int val, int max) {
   int i = 0;
   while (i<max && ((val & (1<<i)) == 0)) i++;
   return i;
 }
+
+/**
+ * 将 IB Verbs 的宽度位掩码转换为实际宽度值（lanes）
+ * 例如：IBV_WIDTH_4X (位掩码) -> 4 (lanes)
+ */
 static int ncclIbWidth(int width) {
   return ibvWidths[firstBitSet(width, sizeof(ibvWidths)/sizeof(int)-1)];
 }
+
+/**
+ * 将 IB Verbs 的速度位掩码转换为实际速度值（Mbps per lane）
+ * 例如：IBV_PORT_SPEED_25G (位掩码) -> 25000 (Mbps per lane)
+ */
 static int ncclIbSpeed(int speed) {
   return ibvSpeeds[firstBitSet(speed, sizeof(ibvSpeeds)/sizeof(int)-1)];
 }
@@ -144,44 +171,91 @@ static int ncclIbRelaxedOrderingCapable(void) {
   return r == ncclInternalError ? 0 : 1;
 }
 
+/**
+ * 【IB 网卡初始化函数】发现和初始化所有 InfiniBand/RoCE 网卡
+ * 
+ * 这是硬件发现的核心函数，负责：
+ * 1. 加载 IB Verbs 库符号（wrap_ibv_symbols）
+ * 2. 查找 IP 接口（用于 OOB 通信）
+ * 3. 枚举所有 IB 网卡设备（ibv_get_device_list）
+ * 4. 打开每个网卡设备（ibv_open_device）
+ * 5. 查询设备属性（ibv_query_device）
+ * 6. 遍历所有端口，检查端口状态和链路类型
+ * 7. 计算网卡速度（speed = active_speed * active_width）
+ * 8. 保存网卡信息到全局数组 ncclIbDevs
+ * 
+ * 调用时机：
+ * - 在 ncclInit() -> ncclNetPluginInit() -> netGetState() -> ncclNetIb.init() 中被调用
+ * - 只初始化一次（通过 ncclNIbDevs == -1 检查）
+ * 
+ * 关键点：
+ * - 使用互斥锁保护初始化过程（ncclIbLock）
+ * - 支持用户通过 NCCL_IB_HCA 环境变量指定网卡
+ * - 只接受 ACTIVE 状态的端口
+ * - 支持 InfiniBand 和 RoCE（Ethernet）两种链路类型
+ * - 速度计算：如果 400G 网卡被错误识别，会在拓扑打分时降权
+ */
 ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
+  // 如果禁用了 IB，直接返回错误
   if (ncclParamIbDisable()) return ncclInternalError;
   static int shownIbHcaEnv = 0;
+  
+  // 【步骤 1】加载 IB Verbs 库符号（动态链接）
+  // 如果加载失败，说明系统没有安装 IB 驱动或库
   if(wrap_ibv_symbols() != ncclSuccess) { return ncclInternalError; }
 
+  // 【步骤 2】检查是否已经初始化过（只初始化一次）
   if (ncclNIbDevs == -1) {
     pthread_mutex_lock(&ncclIbLock);
+    // 初始化 fork 支持（多进程环境下需要）
     wrap_ibv_fork_init();
+    
+    // 双重检查（double-check locking pattern）
     if (ncclNIbDevs == -1) {
       ncclNIbDevs = 0;
+      
+      // 【步骤 3】查找 IP 接口（用于 OOB - Out-of-Band 通信，如 bootstrap）
+      // OOB 通信用于进程间协调，不用于数据传输
       if (ncclFindInterfaces(ncclIbIfName, &ncclIbIfAddr, MAX_IF_NAME_SIZE, 1) != 1) {
         WARN("NET/IB : No IP interface found.");
         return ncclInternalError;
       }
 
-      // Detect IB cards
+      // 【步骤 4】检测 IB 网卡
       int nIbDevs;
       struct ibv_device** devices;
 
-      // Check if user defined which IB device:port to use
+      // 【步骤 5】检查用户是否通过环境变量指定了要使用的 IB 设备
+      // NCCL_IB_HCA 格式：设备名:端口，例如 "mlx5_0:1,mlx5_1:1"
+      // 支持前缀：
+      //   ^ 表示排除（NOT）
+      //   = 表示精确匹配
       char* userIbEnv = getenv("NCCL_IB_HCA");
       if (userIbEnv != NULL && shownIbHcaEnv++ == 0) INFO(NCCL_NET|NCCL_ENV, "NCCL_IB_HCA set to %s", userIbEnv);
       struct netIf userIfs[MAX_IB_DEVS];
-      bool searchNot = userIbEnv && userIbEnv[0] == '^';
+      bool searchNot = userIbEnv && userIbEnv[0] == '^';  // 排除模式
       if (searchNot) userIbEnv++;
-      bool searchExact = userIbEnv && userIbEnv[0] == '=';
+      bool searchExact = userIbEnv && userIbEnv[0] == '=';  // 精确匹配模式
       if (searchExact) userIbEnv++;
       int nUserIfs = parseStringList(userIbEnv, userIfs, MAX_IB_DEVS);
 
+      // 【步骤 6】调用 IB Verbs API 获取所有 IB 设备列表
+      // 这是第一次真正调用驱动 API
       if (ncclSuccess != wrap_ibv_get_device_list(&devices, &nIbDevs)) return ncclInternalError;
 
+      // 【步骤 7】遍历所有 IB 设备
       for (int d=0; d<nIbDevs && ncclNIbDevs<MAX_IB_DEVS; d++) {
         struct ibv_context * context;
+        
+        // 【步骤 7.1】打开设备，获取 context（设备句柄）
+        // context 用于后续的查询和操作
         if (ncclSuccess != wrap_ibv_open_device(&context, devices[d]) || context == NULL) {
           WARN("NET/IB : Unable to open device %s", devices[d]->name);
           continue;
         }
         int nPorts = 0;
+        
+        // 【步骤 7.2】查询设备属性（设备能力、最大 QP 数等）
         struct ibv_device_attr devAttr;
         memset(&devAttr, 0, sizeof(devAttr));
         if (ncclSuccess != wrap_ibv_query_device(context, &devAttr)) {
@@ -189,54 +263,86 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
           if (ncclSuccess != wrap_ibv_close_device(context)) { return ncclInternalError; }
           continue;
         }
+        
+        // 【步骤 7.3】遍历设备的所有物理端口
         for (int port = 1; port <= devAttr.phys_port_cnt; port++) {
           struct ibv_port_attr portAttr;
+          
+          // 【步骤 7.3.1】查询端口属性（状态、速度、链路类型等）
           if (ncclSuccess != wrap_ibv_query_port(context, port, &portAttr)) {
             WARN("NET/IB : Unable to query port %d", port);
             continue;
           }
+          
+          // 【步骤 7.3.2】只接受 ACTIVE 状态的端口（端口必须已连接并激活）
           if (portAttr.state != IBV_PORT_ACTIVE) continue;
+          
+          // 【步骤 7.3.3】只接受 InfiniBand 或 RoCE（Ethernet）链路类型
+          // 排除其他链路类型（如 IPoIB）
           if (portAttr.link_layer != IBV_LINK_LAYER_INFINIBAND
               && portAttr.link_layer != IBV_LINK_LAYER_ETHERNET) continue;
 
-          // check against user specified HCAs/ports
+          // 【步骤 7.3.4】检查端口是否匹配用户指定的 HCA/端口列表
+          // matchIfList 检查设备名和端口是否在用户列表中
+          // searchNot: 如果为 true，则排除匹配的；如果为 false，则只接受匹配的
           if (! (matchIfList(devices[d]->name, port, userIfs, nUserIfs, searchExact) ^ searchNot)) {
             continue;
           }
+          
+          // 【步骤 7.3.5】记录发现的端口信息
           TRACE(NCCL_INIT|NCCL_NET,"NET/IB: [%d] %s:%d/%s ", d, devices[d]->name, port,
               portAttr.link_layer == IBV_LINK_LAYER_INFINIBAND ? "IB" : "RoCE");
+          
+          // 初始化设备结构体
           pthread_mutex_init(&ncclIbDevs[ncclNIbDevs].lock, NULL);
           ncclIbDevs[ncclNIbDevs].device = d;
-          ncclIbDevs[ncclNIbDevs].guid = devAttr.sys_image_guid;
+          ncclIbDevs[ncclNIbDevs].guid = devAttr.sys_image_guid;  // 系统镜像 GUID（唯一标识）
           ncclIbDevs[ncclNIbDevs].port = port;
-          ncclIbDevs[ncclNIbDevs].link = portAttr.link_layer;
+          ncclIbDevs[ncclNIbDevs].link = portAttr.link_layer;  // 链路类型（IB 或 RoCE）
+          
+          // 【关键】计算网卡速度：speed = active_speed * active_width
+          // active_speed: 实际速度（Mbps per lane），例如 25000 表示 25Gbps per lane
+          // active_width: 实际宽度（lanes），例如 4 表示 4x
+          // 最终速度：25000 * 4 = 100 Gbps
+          // 注意：如果 400G 网卡被错误识别（比如只识别成 100G），NCCL 会在拓扑打分时降权
           ncclIbDevs[ncclNIbDevs].speed = ncclIbSpeed(portAttr.active_speed) * ncclIbWidth(portAttr.active_width);
+          
           ncclIbDevs[ncclNIbDevs].context = context;
-          ncclIbDevs[ncclNIbDevs].pdRefs = 0;
+          ncclIbDevs[ncclNIbDevs].pdRefs = 0;  // Protection Domain 引用计数
           ncclIbDevs[ncclNIbDevs].pd = NULL;
           strncpy(ncclIbDevs[ncclNIbDevs].devName, devices[d]->name, MAXNAMESIZE);
+          
+          // 获取 PCI 路径（用于拓扑匹配）
           NCCLCHECK(ncclIbGetPciPath(ncclIbDevs[ncclNIbDevs].devName, &ncclIbDevs[ncclNIbDevs].pciPath, &ncclIbDevs[ncclNIbDevs].realPort));
-          ncclIbDevs[ncclNIbDevs].maxQp = devAttr.max_qp;
-          ncclIbDevs[ncclNIbDevs].mrCache.capacity = 0;
+          
+          ncclIbDevs[ncclNIbDevs].maxQp = devAttr.max_qp;  // 最大 Queue Pair 数量
+          ncclIbDevs[ncclNIbDevs].mrCache.capacity = 0;  // Memory Region 缓存
           ncclIbDevs[ncclNIbDevs].mrCache.population = 0;
           ncclIbDevs[ncclNIbDevs].mrCache.slots = NULL;
 
+          // 为每个设备创建异步事件处理线程
           pthread_create(&ncclIbAsyncThread, NULL, ncclIbAsyncThreadMain, context);
           ncclSetThreadName(ncclIbAsyncThread, "NCCL IbAsync %2d", ncclNIbDevs);
-          pthread_detach(ncclIbAsyncThread); // will not be pthread_join()'d
+          pthread_detach(ncclIbAsyncThread); // 分离线程，不需要 join
           ncclNIbDevs++;
           nPorts++;
         }
+        
+        // 如果设备没有任何可用端口，关闭设备
         if (nPorts == 0 && ncclSuccess != wrap_ibv_close_device(context)) { return ncclInternalError; }
       }
+      
+      // 释放设备列表
       if (nIbDevs && (ncclSuccess != wrap_ibv_free_device_list(devices))) { return ncclInternalError; };
     }
+    
+    // 【步骤 8】打印发现的网卡信息
     if (ncclNIbDevs == 0) {
       INFO(NCCL_INIT|NCCL_NET, "NET/IB : No device found.");
     } else {
       char line[1024];
       line[0] = '\0';
-      // Determine whether RELAXED_ORDERING is enabled and possible
+      // 检查是否支持 RELAXED_ORDERING（PCIe 放松排序，可提升性能）
       ncclIbRelaxedOrderingEnabled = ncclIbRelaxedOrderingCapable();
       for (int d=0; d<ncclNIbDevs; d++) {
         snprintf(line+strlen(line), 1023-strlen(line), " [%d]%s:%d/%s", d, ncclIbDevs[d].devName,
@@ -926,6 +1032,7 @@ returning:
   return res;
 }
 
+// 【数据面-第一次读】从 reqs/slots 取 buffer、length、rkey/addr，填 ibv_sge/ibv_send_wr，最后 wrap_ibv_post_send(comm->qps[q], comm->wrs, &bad_wr)
 ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
   volatile struct ncclIbSendFifo* slots = comm->fifo[slot];
@@ -939,7 +1046,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
     memset(wr, 0, sizeof(struct ibv_send_wr));
 
     struct ibv_sge* sge = comm->sges+r;
-    sge->addr=(uintptr_t)reqs[r]->send.data;
+    sge->addr=(uintptr_t)reqs[r]->send.data;   // 【数据面-第一次读】本地 buffer（可为 GDR 地址）
     sge->lkey=reqs[r]->send.lkey;
 
     wr->opcode = IBV_WR_RDMA_WRITE;
@@ -995,7 +1102,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       }
     }
     struct ibv_send_wr* bad_wr;
-    NCCLCHECK(wrap_ibv_post_send(comm->qps[q], comm->wrs, &bad_wr));
+    NCCLCHECK(wrap_ibv_post_send(comm->qps[q], comm->wrs, &bad_wr));  // 【数据面-第一次读】ibv_post_send：把 WR 提交到 QP 的 SQ，HCA 执行 RDMA Write
 
     for (int r=0; r<nreqs; r++) {
       int chunkSize = DIVUP(DIVUP(reqs[r]->send.size, comm->nqps), align) * align;
@@ -1008,6 +1115,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   return ncclSuccess;
 }
 
+// 【数据面-第一次读】net 层 Isend 入口：从 op/conn 取 data、size、mhandle，等对端 recv 就绪后调 ncclIbMultiSend -> ibv_post_send
 ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   if (comm->ready == 0) NCCLCHECK(ncclSendCheck(comm));
@@ -1064,7 +1172,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
     }
 
     TIME_START(0);
-    NCCLCHECK(ncclIbMultiSend(comm, slot));
+    NCCLCHECK(ncclIbMultiSend(comm, slot));  // 【数据面-第一次读】此处内部调 wrap_ibv_post_send，把 RDMA Write 提交到 QP
 
     // Clear slots[0]->nreqs, as well as other fields to help debugging and sanity checks
     memset((void*)slots, 0, sizeof(struct ncclIbSendFifo));
@@ -1132,12 +1240,13 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
   }
 
   struct ibv_send_wr* bad_wr;
-  NCCLCHECK(wrap_ibv_post_send(comm->qps[0], &wr, &bad_wr));
+  NCCLCHECK(wrap_ibv_post_send(comm->qps[0], &wr, &bad_wr));  // 【数据面-第一次读】recv 侧：RDMA Write 把 recv 信息写到对端 FIFO，通知 sender 可发送
   comm->remFifo.fifoTail++;
 
   return ncclSuccess;
 }
 
+// 【数据面-第一次读】net 层 Irecv：post recv WR 到 RQ，再 ncclIbPostFifo 通知对端
 ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
   if (comm->ready == 0) NCCLCHECK(ncclRecvCheck(comm));
@@ -1162,7 +1271,7 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
   for (int q=0; q<comm->nqps; q++) {
     struct ibv_qp* qp = comm->qps[q];
     struct ibv_recv_wr* bad_wr;
-    NCCLCHECK(wrap_ibv_post_recv(qp, &wr, &bad_wr));
+    NCCLCHECK(wrap_ibv_post_recv(qp, &wr, &bad_wr));  // 【数据面-第一次读】ibv_post_recv：在 RQ 上挂 recv WR，等对端 RDMA_WRITE_WITH_IMM
   }
   TIME_STOP(1);
   req->events = comm->nqps;

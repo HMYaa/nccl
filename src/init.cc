@@ -100,10 +100,23 @@ ncclResult_t ncclGetVersion(int* version) {
   return ncclSuccess;
 }
 
+/**
+ * ncclGetUniqueId: 生成唯一通信ID
+ * 
+ * 功能：生成一个128字节的唯一ID，用于标识一个通信组
+ * 所有要加入同一通信组的rank必须使用相同的uniqueId
+ * 
+ * 使用场景：
+ * - 多进程场景：rank 0生成ID，然后通过某种机制（如文件、环境变量）分发给其他rank
+ * - 单进程多GPU场景（ncclCommInitAll）：所有GPU共享同一个uniqueId
+ */
 NCCL_API(ncclResult_t, ncclGetUniqueId, ncclUniqueId* out);
 ncclResult_t ncclGetUniqueId(ncclUniqueId* out) {
+  // 确保全局初始化已完成
   NCCLCHECK(ncclInit());
+  // 参数校验
   NCCLCHECK(PtrCheck(out, "GetUniqueId", "out"));
+  // 通过Bootstrap机制生成唯一ID（通常是基于时间戳和随机数）
   ncclResult_t res = bootstrapGetUniqueId(out);
   TRACE_CALL("ncclGetUniqueId(0x%llx)", (unsigned long long)hashUniqueId(*out));
   return res;
@@ -290,6 +303,16 @@ exit:
   return ret;
 }
 
+/**
+ * commAlloc: 分配和初始化通信器的基础资源
+ * 
+ * 这是通信器初始化的第一步，负责分配所有基础数据结构：
+ * - 内存管理（永久内存栈、作用域内存栈）
+ * - 网络层初始化
+ * - CUDA Stream创建
+ * - 内存池初始化
+ * - 通道初始化
+ */
 static ncclResult_t commAlloc(ncclComm_t* comret, int ndev, int rank) {
   if (ndev < 1) {
     WARN("invalid device count (%d) requested", ndev);
@@ -301,78 +324,124 @@ static ncclResult_t commAlloc(ncclComm_t* comret, int ndev, int rank) {
   }
 
   struct ncclComm* comm;
-  /* Cuurently we calloc comm in ncclCommInitRankDev for async function support.
-   * This 'if' structure is designed to consider the case where commAlloc is called
-   * in other cases except ncclCommInitRankDev. */
+  /* 目前我们在ncclCommInitRankDev中为异步函数支持分配comm。
+   * 这个if结构是为了考虑commAlloc在其他情况下被调用的情况（除了ncclCommInitRankDev）。 */
   if (*comret == NULL) {
-    /* user requests a new communicator */
+    /* 用户请求一个新的通信器 */
     NCCLCHECK(ncclCalloc(&comm, 1));
     NCCLCHECK(ncclCudaHostCalloc((uint32_t**)&comm->abortFlag, 1));
     NCCLCHECK(ncclCommSetAsyncError(comm, ncclInProgress));
   } else {
-    /* We already allocated a communicator in ncclCommInitRankDev. */
+    /* 通信器已经在ncclCommInitRankDev中分配了 */
     comm = *comret;
   }
 
+  // ========== 内存管理初始化 ==========
+  // 永久内存栈：在整个通信器生命周期内存在
   ncclMemoryStackConstruct(&comm->memPermanent);
+  // 作用域内存栈：在特定作用域内使用
   ncclMemoryStackConstruct(&comm->memScoped);
   comm->destructorHead = nullptr;
+  
+  // ========== 设置基本rank信息 ==========
   comm->rank = rank;
   comm->nRanks = ndev;
 
+  // ========== 网络层初始化 ==========
+  // 初始化网络抽象层（会检测可用的网络类型：IB、Socket等）
   NCCLCHECK(ncclNetInit(comm));
   INFO(NCCL_INIT, "Using network %s", ncclNetName(comm));
 
-  // Try to create a CUDA object right away. If there is something wrong with
-  // the device we're on (failure cause #1) , better know it early.
+  // ========== CUDA Stream创建 ==========
+  // 立即创建CUDA对象。如果设备有问题（失败原因#1），最好早点知道
+  // deviceStream: 用于GPU Kernel执行
+  // hostStream: 用于Host端操作
   NCCLCHECK(ncclStrongStreamConstruct(&comm->deviceStream));
   NCCLCHECK(ncclStrongStreamConstruct(&comm->hostStream));
 
+  // ========== 获取GPU信息 ==========
+  // 获取当前CUDA设备ID
   cudaGetDevice(&comm->cudaDev);
+  // 获取GPU的PCIe Bus ID（用于拓扑检测和P2P通信）
   NCCLCHECK(getBusId(comm->cudaDev, &comm->busId));
   TRACE(NCCL_INIT,"comm %p rank %d nranks %d cudaDev %d busId %lx", comm, rank, ndev, comm->cudaDev, comm->busId);
 
+  // ========== 功能特性检测 ==========
+  // 是否启用指针检查（调试用）
   comm->checkPointers = ncclParamCheckPointers() == 1 ? true : false;
+  // 是否支持DMA Buffer（用于零拷贝）
   comm->dmaBufSupport = (dmaBufSupported(comm) == ncclSuccess) ? true : false;
-
+  // CollNet支持（集合网络，用于特定硬件加速）
   comm->collNetSupport = 0;
 
-  ncclMemoryPoolConstruct(&comm->memPool_ncclKernelPlan);
-  ncclMemoryPoolConstruct(&comm->memPool_ncclProxyOp);
-  ncclMemoryPoolConstruct(&comm->memPool_ncclPointerList);
+  // ========== 内存池初始化 ==========
+  // 为不同类型的内存分配请求创建内存池，提高分配效率
+  ncclMemoryPoolConstruct(&comm->memPool_ncclKernelPlan);  // Kernel计划内存池
+  ncclMemoryPoolConstruct(&comm->memPool_ncclProxyOp);      // Proxy操作内存池
+  ncclMemoryPoolConstruct(&comm->memPool_ncclPointerList);  // 指针列表内存池
 
+  // ========== 通信器链表初始化 ==========
+  // 用于组语义和预连接管理
   comm->groupNext = reinterpret_cast<struct ncclComm*>(0x1);
   comm->preconnectNext = reinterpret_cast<struct ncclComm*>(0x1);
+  // 通道大小（聚合通道的理想大小，用于充分利用带宽）
   comm->channelSize = ncclParamAggChannelSize();
 
+  // ========== 通道连接状态位图 ==========
+  // 使用位图跟踪每个rank的发送/接收通道连接状态
+  // connectSend/connectRecv: 每个rank一个uint64_t，每个bit代表一个通道
   static_assert(MAXCHANNELS <= sizeof(*comm->connectSend)*8, "comm->connectSend must have enough bits for all channels");
   static_assert(MAXCHANNELS <= sizeof(*comm->connectRecv)*8, "comm->connectRecv must have enough bits for all channels");
   NCCLCHECK(ncclCalloc(&comm->connectSend, comm->nRanks));
   NCCLCHECK(ncclCalloc(&comm->connectRecv, comm->nRanks));
 
-  // Mark channels as non initialized.
+  // ========== 通道初始化 ==========
+  // 标记所有通道为未初始化状态（id = -1）
   for (int c=0; c < MAXCHANNELS; c++) comm->channels[c].id = -1;
 
+  // ========== 回调队列初始化 ==========
+  // 多生产者单消费者（MPSC）队列，用于异步回调
   ncclIntruQueueMpscConstruct(&comm->callbackQueue);
 
   *comret = comm;
   return ncclSuccess;
 }
 
+/**
+ * devCommSetup: 设置设备端（GPU）通信器
+ * 
+ * 功能：在GPU可访问的内存中创建通信器结构，使得GPU Kernel可以直接访问通信器信息
+ * 
+ * 主要工作：
+ * 1. 获取CUDA Stream
+ * 2. 在GPU内存中分配ncclDevCommAndChannels结构
+ * 3. 将Host端的通信器信息复制到GPU内存
+ * 4. 设置工作队列（workFifo）相关参数
+ */
 static ncclResult_t devCommSetup(ncclComm_t comm) {
+  // 获取设备Stream（用于异步内存分配和复制）
   NCCLCHECK(ncclStrongStreamAcquireUncaptured(&comm->deviceStream));
 
   int nRanks = comm->nRanks;
   struct ncclDevCommAndChannels *devCommAndChans, tmpCommAndChans;
+  
+  // ========== 在GPU内存中分配设备端通信器结构 ==========
+  // 这个结构体包含通信器信息和所有通道信息，GPU Kernel可以直接访问
   NCCLCHECK(ncclCudaCallocAsync(&devCommAndChans, 1, comm->deviceStream.stream));
+  // 注册到清理列表，通信器销毁时自动释放
   ncclCommPushCudaFree(comm, devCommAndChans);
   comm->devComm = &devCommAndChans->comm;
+  
+  // ========== 准备要复制到GPU的数据 ==========
+  // 在Host端准备临时结构，然后复制到GPU
   tmpCommAndChans.comm.rank = comm->rank;
   tmpCommAndChans.comm.nRanks = nRanks;
-  tmpCommAndChans.comm.abortFlag = comm->abortFlag;
+  tmpCommAndChans.comm.abortFlag = comm->abortFlag;  // GPU可以读取此标志检查是否需要中止
+  // 复制各协议的缓冲区大小（Simple/LL/LL128）
   for (int p=0; p < NCCL_NUM_PROTOCOLS; p++) {
     tmpCommAndChans.comm.buffSizes[p] = comm->buffSizes[p];
   }
+  // 设置通道指针（指向GPU内存中的通道数组）
   tmpCommAndChans.comm.channels = &devCommAndChans->channels[0];
 
   comm->workFifoDepth = ncclParamWorkFifoDepth();
@@ -504,22 +573,46 @@ NCCL_PARAM(CollNetNodeThreshold, "COLLNET_NODE_THRESHOLD", 2);
 NCCL_PARAM(NvbPreconnect, "NVB_PRECONNECT", 1);
 NCCL_PARAM(AllocP2pNetLLBuffers, "NCCL_ALLOC_P2P_NET_LL_BUFFERS", 0);
 
+/**
+ * initTransportsRank: 初始化传输层（核心初始化函数）
+ * 
+ * 这是通信器初始化最复杂的部分，负责建立所有rank之间的网络连接
+ * 
+ * 主要步骤：
+ * 1. Bootstrap初始化：建立进程间通信机制
+ * 2. AllGather1：收集所有rank的peerInfo（hostHash、busId、compCap等）
+ * 3. 拓扑检测：检测GPU与NIC之间的连接关系
+ * 4. CPU亲和性设置：绑定到与GPU相近的CPU
+ * 5. 启动Proxy线程：用于后续的数据移动
+ * 6. AllGather2：收集通道数、图信息、拓扑rank
+ * 7. 建立传输连接：初始化IB Verbs/Socket等传输层
+ * 
+ * 注意：我们使用2次AllGather操作
+ *   - AllGather1: { peerInfo, comm, compCap }
+ *   - AllGather2: { nChannels, graphInfo, topoRanks }
+ */
 static ncclResult_t initTransportsRank(struct ncclComm* comm, ncclUniqueId* commId) {
-  // We use 2 AllGathers
-  // 1. { peerInfo, comm, compCap}
-  // 2. { nChannels, graphInfo, topoRanks }
-
   int rank = comm->rank;
   int nranks = comm->nRanks;
   uint64_t commHash = getHash(commId->internal, NCCL_UNIQUE_ID_BYTES);
   TRACE(NCCL_INIT, "comm %p, commHash %lx, rank %d nranks %d - BEGIN", comm, commHash, rank, nranks);
+  
+  // ========== 步骤1: Bootstrap初始化 ==========
+  // 建立进程间通信机制（用于多进程场景下的rank发现和同步）
+  // 在单进程多GPU场景下，这仍然需要用于rank间的同步
   NCCLCHECK(bootstrapInit(commId, comm));
 
-  // AllGather1 - begin
+  // ========== 步骤2: AllGather1 - 收集所有rank的peerInfo ==========
+  // 分配peerInfo数组（nranks+1，额外一个用于CollNet root）
   NCCLCHECK(ncclCalloc(&comm->peerInfo, nranks+1)); // Extra rank to represent CollNet root
+  
+  // 填充当前rank的peerInfo（hostHash、busId、compCap等）
   NCCLCHECK(fillInfo(comm, comm->peerInfo+rank, commHash));
+  
+  // 通过Bootstrap进行AllGather，收集所有rank的peerInfo
   NCCLCHECK(bootstrapAllGather(comm->bootstrap, comm->peerInfo, sizeof(struct ncclPeerInfo)));
 
+  // 检查是否有重复的GPU（同一host上相同busId的GPU）
   for (int i = 0; i < nranks; i++) {
     if ((i != rank) && (comm->peerInfo[i].hostHash == comm->peerInfo[rank].hostHash) && (comm->peerInfo[i].busId == comm->peerInfo[rank].busId)) {
       WARN("Duplicate GPU detected : rank %d and rank %d both on CUDA device %lx", rank, i, comm->peerInfo[rank].busId);
@@ -527,23 +620,28 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, ncclUniqueId* comm
     }
   }
 
-  // AllGather1 - end
-
-  // Topo detection / System graph creation
+  // ========== 步骤3: 拓扑检测和系统图创建 ==========
+  // 获取系统拓扑结构（GPU、NIC、CPU、PCIe交换机等）
   NCCLCHECK(ncclTopoGetSystem(comm, &comm->topo));
-  // Compute paths between GPUs and NICs
+  
+  // 计算GPU与NIC之间的路径（用于选择最优的通信路径）
   NCCLCHECK(ncclTopoComputePaths(comm->topo, comm));
-  // Remove inaccessible GPUs and unused NICs
+  
+  // 移除不可达的GPU和未使用的NIC（优化拓扑图）
   NCCLCHECK(ncclTopoTrimSystem(comm->topo, comm));
-  // Recompute paths after trimming
+  
+  // 修剪后重新计算路径
   NCCLCHECK(ncclTopoComputePaths(comm->topo, comm));
-  // Init search
+  
+  // 初始化拓扑搜索（用于后续的算法选择）
   NCCLCHECK(ncclTopoSearchInit(comm->topo));
-  // Print final topology
+  
+  // 打印最终拓扑（调试用）
   NCCLCHECK(ncclTopoPrint(comm->topo));
 
-  // Set Affinity to a CPU local the our GPU, so that all memory we allocate
-  // on the host is local.
+  // ========== 步骤4: CPU亲和性设置 ==========
+  // 设置CPU亲和性到与GPU相近的CPU，这样我们分配的所有Host内存都是本地的
+  // 这可以提高NUMA性能（减少跨NUMA节点的内存访问）
   NCCLCHECK(ncclTopoGetCpuAffinity(comm->topo, comm->rank, &comm->cpuAffinity));
   cpu_set_t affinitySave;
   if (CPU_COUNT(&comm->cpuAffinity)) {
@@ -552,7 +650,11 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, ncclUniqueId* comm
   }
   ncclResult_t ret;
 
-  // Launch proxy service thread
+  // ========== 步骤5: 启动Proxy服务线程 ==========
+  // Proxy线程负责：
+  // - 处理网络通信（调用IB Verbs API如ibv_post_send）
+  // - 管理数据移动（Host <-> GPU <-> Network）
+  // - 处理异步操作
   NCCLCHECK(ncclProxyCreate(comm));
 
   // Get rings and trees
@@ -1068,6 +1170,15 @@ struct ncclCommFinalizeAsyncJob {
   ncclComm_t comm;
 };
 
+/**
+ * ncclCommInitRankFunc: 异步初始化函数的实际执行体
+ * 
+ * 这是真正执行通信器初始化的函数，在ncclAsyncLaunch中被调用
+ * 主要完成三个核心步骤：
+ * 1. commAlloc: 分配通信器资源
+ * 2. initTransportsRank: 初始化传输层（建立IB/Socket连接）
+ * 3. devCommSetup: 设置设备端通信器
+ */
 static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   struct ncclCommInitRankAsyncJob* job = (struct ncclCommInitRankAsyncJob*)job_;
   ncclComm_t* newcomm = job->newcomm;
@@ -1078,36 +1189,78 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   int cudaDev = job->cudaDev;
   ncclResult_t res = ncclSuccess;
 
+  // ========== 步骤1: 设置CUDA设备 ==========
+  // 切换到指定的CUDA设备
   CUDACHECK(cudaSetDevice(cudaDev));
-  // Set the maximum kernel stack size of all kernels to avoid
-  // a CUDA memory reconfig on load (c.f. NVSHMEM issue)
+  
+  // 设置Kernel栈大小限制，避免CUDA内存重配置（参考NVSHMEM问题）
+  // 这可以避免在加载时触发CUDA内存重新配置
   if (maxLocalSizeBytes > 0 && ncclParamSetStackSize() == 1) {
     TRACE(NCCL_INIT, "Setting cudaLimitStackSize to %zi", maxLocalSizeBytes);
     CUDACHECKIGNORE(cudaDeviceSetLimit(cudaLimitStackSize, maxLocalSizeBytes));
   }
+  
+  // ========== 步骤2: 分配通信器资源 ==========
+  // commAlloc主要工作：
+  // - 初始化ncclComm结构体（rank、nRanks等）
+  // - 初始化网络层（ncclNetInit）
+  // - 创建CUDA Stream（deviceStream、hostStream）
+  // - 获取GPU Bus ID
+  // - 初始化内存池和通道
   NCCLCHECKGOTO(commAlloc(newcomm, nranks, myrank), res, cleanup);
+  
+  // ========== 步骤3: 初始化传输层 ==========
+  // initTransportsRank是核心函数，负责：
+  // - Bootstrap初始化（建立进程间通信）
+  // - AllGather收集所有rank的peerInfo
+  // - 拓扑检测（GPU与NIC之间的路径）
+  // - 启动Proxy线程
+  // - 建立传输连接（IB Verbs/Socket等）
   NCCLCHECKGOTO(initTransportsRank(*newcomm, &commId), res, cleanup);
+  
+  // ========== 步骤4: 设备端通信器设置 ==========
+  // devCommSetup主要工作：
+  // - 获取CUDA Stream
+  // - 分配设备端ncclDevCommAndChannels结构
+  // - 将通信器信息复制到GPU可访问内存
   NCCLCHECKGOTO(devCommSetup(*newcomm), res, cleanup);
 
-  // update communicator state
+  // ========== 步骤5: 标记初始化完成 ==========
+  // 更新通信器状态为成功
   comm->initState = ncclSuccess;
 
   INFO(NCCL_INIT,"comm %p rank %d nranks %d cudaDev %d busId %lx - Init COMPLETE", *newcomm, myrank, nranks, (*newcomm)->cudaDev, (*newcomm)->busId);
   TRACE_CALL("ncclCommInitRank(%p,%d,0x%llx,%d,%d)", *newcomm, nranks, (unsigned long long)hashUniqueId(commId), myrank, (*newcomm)->cudaDev);
   return ncclSuccess;
+  
 cleanup:
+  // 如果初始化失败，记录错误状态
   comm->initState = res;
   return res;
 }
 
+/**
+ * parseCommConfig: 解析并设置通信器配置
+ * 
+ * 功能：从config参数中读取配置并设置到通信器中
+ * 
+ * 当前支持的配置：
+ *   - blocking: 是否使用阻塞模式
+ *     * blocking=1: 阻塞模式，操作会等待完成
+ *     * blocking=0: 非阻塞模式，操作异步执行
+ * 
+ * 默认配置：blocking=1（阻塞模式）
+ */
 static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
   ncclResult_t ret = ncclSuccess;
 
-  /* first set configuration */
+  /* 首先设置配置 */
   if (config) {
+    // 如果提供了配置，使用配置中的值
     comm->blocking = config->blocking;
   } else {
-    /* default setting of communicator */
+    /* 通信器的默认设置 */
+    // 默认使用阻塞模式
     comm->blocking = 1;
   }
 
@@ -1120,22 +1273,45 @@ static void ncclCommInitRankUndo(struct ncclAsyncJob* job_) {
   *job->newcomm = nullptr;
 }
 
+/**
+ * ncclCommInitRankDev: 单个rank的通信器初始化（设备级别）
+ * 
+ * 这是每个rank初始化的核心函数，负责：
+ * 1. 创建通信器对象
+ * 2. 设置初始状态
+ * 3. 异步启动实际的初始化任务
+ * 
+ * 参数：
+ *   - newcomm: 输出参数，返回创建的通信器
+ *   - nranks: 通信组中的总rank数
+ *   - commId: 唯一通信ID（所有rank共享）
+ *   - myrank: 当前rank的ID
+ *   - cudaDev: CUDA设备ID
+ *   - config: 可选的配置参数
+ */
 static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank, int cudaDev, ncclConfig_t *config) {
   ncclResult_t res;
   ncclComm_t comm = NULL;
   struct ncclCommInitRankAsyncJob *job = NULL;
+  
+  // ========== 步骤1: 环境变量检查 ==========
+  // 如果设置了NCCL_COMM_ID环境变量，使用环境变量中的ID（通常用于调试）
   char* env = getenv("NCCL_COMM_ID");
   if (env && myrank == 0) {
     INFO(NCCL_ENV, "NCCL_COMM_ID set by environment to %s", env);
     NCCLCHECKGOTO(bootstrapCreateRoot(&commId, true), res, fail);
   }
 
+  // ========== 步骤2: 全局初始化 ==========
+  // ncclInit()是全局初始化函数，只会执行一次（使用原子变量和互斥锁保护）
+  // 初始化内容：GDR、网络插件、Bootstrap网络等
   NCCLCHECKGOTO(ncclInit(), res, fail);
   if (myrank == 0) showVersion();
 
-  // Make sure the CUDA runtime is initialized.
+  // 确保CUDA运行时已初始化（通过调用cudaFree(NULL)）
   CUDACHECKGOTO(cudaFree(NULL), res, fail);
 
+  // ========== 步骤3: 参数校验 ==========
   NCCLCHECKGOTO(PtrCheck(newcomm, "CommInitRank", "newcomm"), res, fail);
   if (nranks < 1 || myrank < 0 || myrank >= nranks) {
     WARN("Invalid rank requested : %d/%d", myrank, nranks);
@@ -1143,21 +1319,41 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, ncclUni
     goto fail;
   }
 
+  // ========== 步骤4: 创建通信器对象 ==========
+  // 分配通信器结构体内存
   NCCLCHECKGOTO(ncclCalloc(&comm, 1), res, fail);
+  
+  // 分配GPU可访问的主机内存，用于abortFlag（GPU可以读取此标志来检查是否需要中止）
+  // 
+  // 为什么必须用 ncclCudaHostCalloc 而不是 malloc？
+  // 1. GPU Kernel在执行时会定期检查 abortFlag（见 src/collectives/device/common.h:198）
+  // 2. GPU必须能直接通过PCIe读取这个标志，不能等CPU复制（实时性要求）
+  // 3. ncclCudaHostCalloc分配的是Pinned Memory（固定内存），GPU可以直接访问
+  // 4. 如果用malloc，GPU无法直接访问，需要cudaMemcpy复制，延迟高且可能错过中止信号
+  // 
+  // 类比：这是CPU和GPU之间的"共享公告板"，双方都能直接看到，而不是"私人笔记本"
   NCCLCHECKGOTO(ncclCudaHostCalloc((uint32_t**)&comm->abortFlag, 1), res, fail);
-  // set up comm state and abortFlag only
-  *comm->abortFlag = 0;
+  *comm->abortFlag = 0;  // 初始化为0（无中止）
+  
+  // 解析并设置通信器配置（如blocking模式）
   NCCLCHECKGOTO(parseCommConfig(comm, config), res, fail);
-  /* start with ncclInternalError and will be changed to ncclSuccess if init succeeds. */
+  
+  // 初始状态设为错误，只有初始化成功后才改为ncclSuccess
   comm->initState = ncclInternalError;
   *newcomm = comm;
 
+  // ========== 步骤5: 创建异步初始化任务 ==========
+  // 分配异步任务结构体
   NCCLCHECKGOTO(ncclCalloc(&job, 1), res, fail);
   job->newcomm = newcomm;
   job->nranks = nranks;
   job->commId = commId; // C++ struct assignment
   job->myrank = myrank;
   job->cudaDev = cudaDev;
+  
+  // 异步启动初始化任务
+  // 如果不在组内（ncclGroupDepth == 0）：立即执行ncclCommInitRankFunc
+  // 如果在组内（ncclGroupDepth > 0）：将任务加入队列，等待ncclGroupEnd时统一执行
   NCCLCHECKGOTO(ncclAsyncLaunch(&job->base, ncclCommInitRankFunc, NULL, free, comm), res, fail);
 
 exit:
@@ -1166,63 +1362,115 @@ fail:
   goto exit;
 }
 
+/**
+ * ncclCommInitRank: 多进程/多线程初始化函数
+ * 
+ * 功能：为单个rank创建通信器（多进程或多线程场景）
+ * 
+ * 与ncclCommInitAll的区别：
+ * - ncclCommInitAll: 单进程多GPU，自动处理所有GPU
+ * - ncclCommInitRank: 多进程/多线程，每个进程/线程只初始化一个rank
+ * 
+ * 使用场景：
+ * - 多进程训练（每个进程一个GPU）
+ * - 多线程训练（每个线程一个GPU）
+ * - 需要手动管理每个rank的初始化
+ * 
+ * 注意：所有rank必须使用相同的commId和nranks
+ */
 NCCL_API(ncclResult_t, ncclCommInitRank, ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank);
 ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank) {
   NVTX3_FUNC_RANGE_IN(nccl_domain);
 
-  // Load the CUDA driver and dlsym hooks (can fail on old drivers)
+  // 加载CUDA驱动和dlsym钩子（旧驱动可能失败）
   (void) cudaLibraryInit();
 
+  // 获取当前CUDA设备（每个进程/线程应该已经设置了对应的设备）
   int cudaDev;
   CUDACHECK(cudaGetDevice(&cudaDev));
+  
+  // 调用核心初始化函数（使用当前设备）
   NCCLCHECK(ncclCommInitRankDev(newcomm, nranks, commId, myrank, cudaDev, NULL));
   return ncclSuccess;
 }
 
 NCCL_API(ncclResult_t, ncclCommInitAll, ncclComm_t* comms, int ndev, const int* devlist);
+/**
+ * ncclCommInitAll: 单进程多GPU初始化函数
+ * 
+ * 功能：在单个进程内为多个GPU创建通信器（communicator）
+ * 适用场景：单机多卡训练，所有GPU在同一进程内
+ * 
+ * 参数：
+ *   - comms: 输出参数，返回ndev个通信器对象的数组
+ *   - ndev: 要初始化的GPU数量
+ *   - devlist: 可选的GPU设备ID列表，如果为NULL则使用前ndev个GPU
+ */
 ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int* devlist) {
   NVTX3_FUNC_RANGE_IN(nccl_domain);
   ncclResult_t ret = ncclSuccess;
   int totalnDev;
   int *gpuFlags = NULL;
-  // Load the CUDA driver and dlsym hooks (can fail on old drivers)
+  
+  // ========== 阶段1: 前置检查与初始化 ==========
+  // 1. CUDA库初始化 - 加载CUDA驱动和dlsym钩子（旧驱动可能失败）
   (void) cudaLibraryInit();
-
+  
+  // 2. 参数校验 - 检查comms指针是否有效
   NCCLCHECKGOTO(PtrCheck(comms, "CommInitAll", "comms"), ret, fail);
   if (ndev < 0) {
     WARN("Invalid device count requested : %d", ndev);
     ret = ncclInvalidArgument;
     goto fail;
   }
-
+  
+  // 3. 获取系统GPU总数 - 用于后续的设备ID校验
   CUDACHECKGOTO(cudaGetDeviceCount(&totalnDev), ret, fail);
+  
+  // 4. 如果提供了devlist，进行设备列表校验
   if (devlist) {
+    // 分配标志数组，用于检查重复和无效设备
     NCCLCHECKGOTO(ncclCalloc(&gpuFlags, totalnDev), ret, fail);
     for (int i = 0; i < ndev; ++i) {
       /* invalid device check. */
+      // 检查设备ID是否有效（必须在[0, totalnDev)范围内）
       if (devlist[i] < 0 || devlist[i] >= totalnDev) {
         ret = ncclUnhandledCudaError;
         goto fail;
       }
 
       /* duplicate device check. */
+      // 检查是否有重复设备（同一个GPU被指定多次）
       if (gpuFlags[devlist[i]] != 0) {
         ret = ncclInvalidUsage;
         goto fail;
       }
 
-      gpuFlags[devlist[i]] = 1;
+      gpuFlags[devlist[i]] = 1;  // 标记该设备已被使用
     }
     free(gpuFlags);
   }
 
+  // ========== 阶段2: 生成唯一通信ID ==========
+  // 生成一个128字节的唯一ID，用于标识这个通信组
+  // 在单进程多GPU场景下，所有GPU共享同一个uniqueId
   ncclUniqueId uniqueId;
   NCCLCHECKGOTO(ncclGetUniqueId(&uniqueId), ret, fail);
+  
+  // ========== 阶段3: 组语义包装 - 同步初始化多个通信器 ==========
+  // 使用ncclGroupStart/End确保所有通信器同步初始化
+  // 这是因为在单线程中初始化多个通信器需要同步机制
   NCCLCHECKGOTO(ncclGroupStart(), ret, fail);
+  
+  // 为每个GPU创建通信器
+  // 注意：这里使用组语义，所有初始化任务会被加入队列，在ncclGroupEnd时统一执行
   for (int i=0; i<ndev; i++) {
     // Ignore return codes .. we need to call ncclGroupEnd to clean up anyway
+    // 如果devlist为NULL，使用设备i；否则使用devlist[i]
     ncclCommInitRankDev(comms+i, ndev, uniqueId, i, devlist ? devlist[i] : i, NULL);
   }
+  
+  // 执行所有初始化任务（如果不在组内，ncclAsyncLaunch会立即执行）
   NCCLCHECKGOTO(ncclGroupEnd(), ret, fail);
 
 exit:
