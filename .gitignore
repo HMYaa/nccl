@@ -9,3 +9,4 @@ compile_commands.json
 /.cursor
 /.claude
 .clang-format
+CLAUDE.md
