@@ -146,7 +146,7 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
     do {
       (ncclCudaGraphValid(comm->tasks.capturingGraph) ? capturingYes : capturingNo) = true;
       CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
-      NCCLCHECKGOTO(ncclLaunchPrepare(comm), result, failure);
+      NCCLCHECKGOTO(ncclLaunchPrepare(comm), result, failure); // 排产
       if (useBarrier) ncclCommIntraBarrierIn(comm, 1);
       comm = comm->groupNext;
     } while (comm != nullptr && comm->intraComm0 == cliqueComm0);
@@ -175,11 +175,11 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
             comm->unlaunchedPlansHead = plan->next;
             CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
             NCCLCHECKGOTO(ncclLaunchKernelBefore_NoUncapturedCuda(comm, plan), result, failure);  // uploadWork
-            NCCLCHECKGOTO(ncclLaunchKernel(comm, plan), result, failure);
+            NCCLCHECKGOTO(ncclLaunchKernel(comm, plan), result, failure);  // 按排产开火
           }
           if (useBarrier) ncclCommIntraBarrierIn(comm, comm->unlaunchedPlansHead != nullptr ? 1 : 0);
           if (plan != nullptr) {
-            NCCLCHECKGOTO(ncclLaunchKernelAfter_NoCuda(comm, plan), result, failure);  // 非 persistent 时 hostStreamPlanTask
+            NCCLCHECKGOTO(ncclLaunchKernelAfter_NoCuda(comm, plan), result, failure);  // 非 persistent 时 hostStreamPlanTask , 推任务
           }
         } else {
           CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);

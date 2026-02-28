@@ -31,6 +31,13 @@ static float getTotalBw(struct ncclTopoSystem* system, struct ncclTopoNode* gpu)
   }
   return std::max(pciBw, nvlinkBw);
 }
+// 【拓扑-建链】初始化拓扑搜索用字段：maxBw、totalBw 等，供后续 ncclTopoCompute（Ring/Tree/CollNet）使用。
+//
+// 接口说明（便于理解输入输出）:
+//   in   system : 已由 ncclTopoGetSystem 得到，且已调用 ncclTopoComputePaths（路径已算好）。
+//   out  无返回值；副作用：system->maxBw、system->totalBw 被填充（用于搜索时的带宽约束）。
+// 前置: ncclTopoComputePaths(system, comm) 已调用。
+// 后置: system 可供 ncclTopoCompute（Ring/Tree/CollNet）使用。
 ncclResult_t ncclTopoSearchInit(struct ncclTopoSystem* system) {
   system->maxBw = 0.0;
   system->totalBw = 0.0;

@@ -279,6 +279,13 @@ static ncclResult_t ncclTopoPrintRec(struct ncclTopoNode* node, struct ncclTopoN
   return ncclSuccess;
 }
 
+// 【拓扑-建链】将拓扑图与路径打印到日志（NCCL_DEBUG=INFO 时可见），仅调试用，无业务副作用。
+//
+// 接口说明（便于理解输入输出）:
+//   in   s : 已建好且路径已算好的 ncclTopoSystem（通常为 comm->topo）。
+//   out  无返回值；副作用：向 NCCL 日志输出 system 与 paths 的可读信息。
+// 前置: 无（s 有效即可）。
+// 后置: 无。
 ncclResult_t ncclTopoPrint(struct ncclTopoSystem* s) {
   INFO(NCCL_GRAPH, "=== System : maxBw %2.1f totalBw %2.1f ===", s->maxBw, s->totalBw);
   char line[1024];
@@ -592,9 +599,19 @@ static ncclResult_t xmlInitAttrFloat(struct ncclXmlNode* node, const char* attrN
 }
 
 
+// 【拓扑-建链】根据 comm 与 peerInfo 构建本机视角的硬件拓扑图（GPU/CPU/PCI/NIC 及连接）。
+//
+// 接口说明（便于理解输入输出）:
+//   in   comm   : 已分配；comm->rank, comm->nRanks 有效。
+//   in   comm->peerInfo[0..nRanks-1] : 已由 AllGather1 填好；含 busId, hostHash, gdrSupport 等。
+//   out  *system: 返回新分配的 ncclTopoSystem*；由调用方持有并在适当时机 ncclTopoFree。
+//   in   comm->ncclNet / collNetSupport / dmaBufSupport 等 : 用于探测 NIC 与 GDR。
+// 前置: bootstrapAllGather(comm->peerInfo) 已执行。
+// 后置: *system 内节点已建好（GPU/CPU/PCI/NET），边为链路关系；尚未计算路径，需调用 ncclTopoComputePaths。
 ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** system) {
   struct ncclXml* xml;
   NCCLCHECK(ncclCalloc(&xml, 1));
+  // 优先从环境变量或默认路径加载拓扑 XML（若存在）；否则从空 XML 开始，下面用探测填充。
   char* xmlTopoFile = getenv("NCCL_TOPO_FILE");
   if (xmlTopoFile) {
     INFO(NCCL_ENV, "NCCL_TOPO_FILE set by environment to %s", xmlTopoFile);
@@ -610,7 +627,8 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
     NCCLCHECK(xmlSetAttrInt(top, "version", NCCL_TOPO_XML_VERSION));
   }
 
-  // Auto-detect GPUs if needed
+  // 【关键】只对本机可见的 rank（hostHash 相同）填充 GPU 节点，并打上 rank、gdr 等属性。
+  // 这样拓扑图里 GPU 与 comm rank 一一对应，后续路径计算和 Trim 才能正确。
   for (int r=0; r<comm->nRanks; r++) {
     if (comm->peerInfo[r].hostHash == comm->peerInfo[comm->rank].hostHash) {
       char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
@@ -623,8 +641,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
       NCCLCHECK(xmlInitAttrInt(node, "gdr", comm->peerInfo[r].gdrSupport));
     }
   }
-  // Auto-detect NICs if needed. net/collnet share the same xml/graph nodes,
-  // so we start with collnet so that it has precedence.
+  // 【关键】探测本机网卡：先 CollNet 再普通 NET，同一套 XML 节点共用；填 speed/port/gdr 等。
   int netDevCount = 0;
   if (collNetSupport(comm)) {
     NCCLCHECK(collNetDevices(comm, &netDevCount));
@@ -665,7 +682,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
     NCCLCHECK(xmlInitAttrInt(netNode, "gdr", gdrSupport));
   }
 
-  // Remove XML branches which don't have a node with keep="1" (typically when importing a topology)
+  // 去掉 XML 中未被标记 keep=1 的分支（例如导入的拓扑里本机用不到的 GPU/NIC）。
   NCCLCHECK(ncclTopoTrimXml(xml));
 
   xmlTopoFile = getenv("NCCL_TOPO_DUMP_FILE");
@@ -674,6 +691,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
     NCCLCHECK(ncclTopoDumpXmlToFile(xmlTopoFile, xml));
   }
 
+  // 从整理好的 XML 构建 ncclTopoSystem 图结构（节点+边，带宽等），供 paths.cc 使用。
   NCCLCHECK(ncclTopoGetSystemFromXml(xml, system));
   free(xml);
   return ncclSuccess;

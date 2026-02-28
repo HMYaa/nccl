@@ -504,34 +504,36 @@ ncclResult_t ncclTopoGetPxnRanks(struct ncclComm* comm, int** intermediateRanks,
   return ncclSuccess;
 }
 
+// 【拓扑-建链】预计算拓扑图中任意节点对之间的“路径”（带宽、跳数、路径类型等）。
+//
+// 接口说明（便于理解输入输出）:
+//   in   system : 已由 ncclTopoGetSystem 得到；节点与边已建好，paths 可为空或旧数据。
+//   in   comm   : 可选；非 NULL 时用于 P2P/SHM canConnect 判断，并标记不可达 GPU 对（paths[][].count=0）。
+//   out  无返回值；副作用：system 内各节点的 paths[type][index] 被填充（bw, count, type 等）。
+// 前置: system 有效；若在 Trim 之后调用，system 已修剪。
+// 后置: 任意 GPU/GPU、GPU/NIC 等对均有路径信息；不可达的 GPU 对（无 P2P 且无 SHM）paths[][].count=0，供 ncclTopoTrimSystem 使用。
 ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm* comm) {
-  // Precompute paths between GPUs/NICs.
-
-  // Remove everything in case we're re-computing
+  // 若是重算（如 Trim 之后），先清空已有路径。
   for (int t=0; t<NCCL_TOPO_NODE_TYPES; t++) ncclTopoRemovePathType(system, t);
 
-  // Set direct paths to CPUs. We need them in many cases.
+  // 为 CPU/GPU/NET 各自到全图做“到所有节点的路径”（带宽、类型）。
   for (int c=0; c<system->nodes[CPU].count; c++) {
     NCCLCHECK(ncclTopoSetPaths(system->nodes[CPU].nodes+c, system));
   }
-
-  // Set direct paths to GPUs.
   for (int g=0; g<system->nodes[GPU].count; g++) {
     NCCLCHECK(ncclTopoSetPaths(system->nodes[GPU].nodes+g, system));
   }
-
-  // Set direct paths to NICs.
   for (int n=0; n<system->nodes[NET].count; n++) {
     NCCLCHECK(ncclTopoSetPaths(system->nodes[NET].nodes+n, system));
   }
 
-  // Update path for GPUs when we don't want to / can't use GPU Direct P2P
+  // 【关键】无法走 GPU Direct P2P 的 GPU 对：路径改为经 CPU 中转；无 P2P 且无 SHM 的标记为不可达。
   for (int g=0; g<system->nodes[GPU].count; g++) {
     for (int p=0; p<system->nodes[GPU].count; p++) {
       int p2p;
       NCCLCHECK(ncclTopoCheckP2p(system, system->nodes[GPU].nodes[p].id, system->nodes[GPU].nodes[g].id, &p2p, NULL, NULL));
       if (p2p == 0) {
-        // Divert all traffic through the CPU
+        // 该 GPU 对无 P2P：路径改为经本 GPU 所在 CPU 中转。
         int cpu;
         NCCLCHECK(getLocalCpu(system, g, &cpu));
         NCCLCHECK(addInterStep(system, CPU, cpu, GPU, p, GPU, g));
@@ -539,7 +541,7 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
     }
 
     if (comm == NULL) continue;
-    // Remove GPUs we can't (or don't want to) communicate with through P2P or SHM
+    // 结合 transport：若某 GPU 对既不能 P2P 也不能 SHM，则标记为不可达（count=0），Trim 会删掉。
     struct ncclPeerInfo* dstInfo = comm->peerInfo+system->nodes[GPU].nodes[g].gpu.rank;
     for (int p=0; p<system->nodes[GPU].count; p++) {
       if (p == g) continue;
@@ -550,14 +552,14 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
         int shm;
         NCCLCHECK(ncclTransports[TRANSPORT_SHM]->canConnect(&shm, system, NULL, srcInfo, dstInfo));
         if (shm == 0) {
-          // Mark this peer as inaccessible. We'll trim it later.
+          // 标记为不可达，后续 ncclTopoTrimSystem 会据此移除不在同一连通分量中的 GPU。
           system->nodes[GPU].nodes[p].paths[GPU][g].count = 0;
         }
       }
     }
   }
 
-  // Update paths for NICs (no GPU Direct, PXN, ...)
+  // 【关键】NIC 路径：支持 PXN 时可为 GPU->NIC 经另一 GPU 中转；无 GDR 时经 CPU 中转。
   for (int n=0; n<system->nodes[NET].count; n++) {
     struct ncclTopoNode* netNode = system->nodes[NET].nodes+n;
 
@@ -593,11 +595,10 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
           NCCLCHECK(addInterStep(system, GPU, pxnGpu, GPU, g, NET, n));
         }
       }
-      // Update path when we dont want to / can't use GPU Direct RDMA.
+      // 无法使用 GPU Direct RDMA 时：GPU<->NIC 流量经该 GPU 本地 CPU 中转。
       int gdr;
       NCCLCHECK(ncclTopoCheckGdr(system, system->nodes[GPU].nodes[g].id, netNode->id, 0, &gdr));
       if (gdr == 0) {
-        // We cannot use GPU Direct RDMA, divert all traffic through the CPU local to the GPU
         int localCpu;
         NCCLCHECK(getLocalCpu(system, g, &localCpu));
         NCCLCHECK(addInterStep(system, CPU, localCpu, NET, n, GPU, g));
@@ -608,11 +609,20 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
   return ncclSuccess;
 }
 
+// 【拓扑-建链】修剪拓扑图：只保留与本 rank 在同一“连通分量”的 GPU；单机时删掉未用到的 NIC。
+//
+// 接口说明（便于理解输入输出）:
+//   in   system : 已由 ncclTopoGetSystem 得到，且已调用过 ncclTopoComputePaths（不可达 GPU 对已标记 count=0）。
+//   in   comm   : comm->rank, comm->nRanks 有效。
+//   out  无返回值；副作用：system 内节点被原地删除——删除与本 rank 不在同一 domain 的 GPU 节点；若 GPU 数==nRanks 则删除所有 NET 节点。
+// 前置: ncclTopoComputePaths(system, comm) 已调用。
+// 后置: system 中仅剩与本 rank 可达的 GPU 及（多机时）所需 NIC；路径表可能失效，必须再调用 ncclTopoComputePaths(system, comm)。
 ncclResult_t ncclTopoTrimSystem(struct ncclTopoSystem* system, struct ncclComm* comm) {
   int *domains;
   int64_t *ids;
   NCCLCHECK(ncclCalloc(&domains, system->nodes[GPU].count));
   NCCLCHECK(ncclCalloc(&ids, system->nodes[GPU].count));
+  // 用并查集思想：根据 paths[GPU][p].count>0 把可达的 GPU 归到同一 domain。
   int myDomain = 0;
   for (int g=0; g<system->nodes[GPU].count; g++) {
     struct ncclTopoNode* gpu = system->nodes[GPU].nodes+g;
@@ -626,6 +636,7 @@ ncclResult_t ncclTopoTrimSystem(struct ncclTopoSystem* system, struct ncclComm* 
     if (gpu->gpu.rank == comm->rank) myDomain = domains[g];
   }
 
+  // 删除所有“不在本 rank 所在 domain”的 GPU 节点（即与本 rank 无法 P2P/SHM 通信的 GPU）。
   int ngpus = system->nodes[GPU].count;
   for (int i=0; i<ngpus; i++) {
     if (domains[i] == myDomain) continue;
@@ -644,6 +655,7 @@ ncclResult_t ncclTopoTrimSystem(struct ncclTopoSystem* system, struct ncclComm* 
     NCCLCHECK(ncclTopoRemoveNode(system, GPU, g));
   }
 
+  // 单机场景（拓扑中 GPU 数 == nRanks）：不需要跨机网络，删除所有 NIC 节点以简化图。
   if (system->nodes[GPU].count == comm->nRanks) {
     for (int n=system->nodes[NET].count-1; n>=0; n--)
       NCCLCHECK(ncclTopoRemoveNode(system, NET, n));

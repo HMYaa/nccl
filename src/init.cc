@@ -621,22 +621,24 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, ncclUniqueId* comm
   }
 
   // ========== 步骤3: 拓扑检测和系统图创建 ==========
-  // 获取系统拓扑结构（GPU、NIC、CPU、PCIe交换机等）
+  //
+  // 【步骤3 整体接口】
+  // 输入(in):  comm 已分配；comm->peerInfo[0..nRanks-1] 已由 AllGather1 填好（含 busId, hostHash, gdrSupport）。
+  // 输出(out): comm->topo 指向可用的 ncclTopoSystem；其内仅含与本 rank 可达的 GPU 及本机 NIC，路径已算好。
+  // 前置条件: initTransportsRank 步骤1、2 已完成（bootstrapInit + AllGather1 peerInfo）。
+  // 后置条件: comm->topo 可供 ncclTopoCompute（Ring/Tree/CollNet）、ncclTransportP2pSetup 等使用。
+  //
+  // 3.1 构建拓扑图
   NCCLCHECK(ncclTopoGetSystem(comm, &comm->topo));
-  
-  // 计算GPU与NIC之间的路径（用于选择最优的通信路径）
+  // 3.2 计算路径（不可达 peer 标记为 count=0，供 Trim 使用）
   NCCLCHECK(ncclTopoComputePaths(comm->topo, comm));
-  
-  // 移除不可达的GPU和未使用的NIC（优化拓扑图）
+  // 3.3 修剪拓扑（去掉不可达 GPU 与单机未用 NIC）
   NCCLCHECK(ncclTopoTrimSystem(comm->topo, comm));
-  
-  // 修剪后重新计算路径
+  // 3.4 修剪后重算路径
   NCCLCHECK(ncclTopoComputePaths(comm->topo, comm));
-  
-  // 初始化拓扑搜索（用于后续的算法选择）
+  // 3.5 初始化拓扑搜索器
   NCCLCHECK(ncclTopoSearchInit(comm->topo));
-  
-  // 打印最终拓扑（调试用）
+  // 3.6 打印拓扑（调试）
   NCCLCHECK(ncclTopoPrint(comm->topo));
 
   // ========== 步骤4: CPU亲和性设置 ==========
