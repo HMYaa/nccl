@@ -4,6 +4,60 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+/*=======================================================================
+ * 【学习导读】net_ib.cc — NCCL 的 InfiniBand/RoCE 传输层实现
+ *
+ * 这是 NCCL 数据面最核心的文件之一。它实现了 ncclNet_t 接口（见文件末尾的
+ * ncclNetIb 函数表），使 NCCL 能通过 IB Verbs API 进行 RDMA 数据传输。
+ *
+ * ====== 整体架构 ======
+ *
+ *  上层（proxy thread）
+ *       │
+ *       ▼
+ *  ncclNetIb 函数表（本文件导出）
+ *  ┌──────────────────────────────────────────────────┐
+ *  │  init        → ncclIbInit()          硬件发现     │
+ *  │  listen      → ncclIbListen()        监听连接     │
+ *  │  connect     → ncclIbConnect()       发起连接     │
+ *  │  accept      → ncclIbAccept()        接受连接     │
+ *  │  regMr       → ncclIbRegMr()         注册 MR      │
+ *  │  deregMr     → ncclIbDeregMr()       注销 MR      │
+ *  │  isend       → ncclIbIsend()         异步发送     │
+ *  │  irecv       → ncclIbIrecv()         异步接收     │
+ *  │  iflush      → ncclIbIflush()        GPU 刷新     │
+ *  │  test        → ncclIbTest()          完成检测     │
+ *  │  closeSend/Recv/Listen → 资源释放                  │
+ *  └──────────────────────────────────────────────────┘
+ *       │
+ *       ▼
+ *  IB Verbs API（ibv_post_send / ibv_poll_cq / ...）
+ *       │
+ *       ▼
+ *  RDMA 网卡硬件（HCA）
+ *
+ * ====== 关键设计：FIFO 通知机制 ======
+ *
+ *  NCCL 不使用传统的 SEND/RECV 双边语义，而是用 RDMA WRITE 单边语义。
+ *  但 RDMA WRITE 需要知道对端的 remote_addr 和 rkey。
+ *
+ *  解决方案：接收端通过 RDMA WRITE 把自己的 {addr, rkey, size} 写到
+ *  发送端的 FIFO 中（ncclIbPostFifo），发送端轮询 FIFO 获取这些信息
+ *  后，才执行真正的数据 RDMA WRITE（ncclIbMultiSend）。
+ *
+ *  数据传输流程：
+ *    1. Recv 端调 ncclIbIrecv → post recv WR + RDMA WRITE 通知到 sender FIFO
+ *    2. Send 端调 ncclIbIsend → 轮询 FIFO 发现对端就绪 → ncclIbMultiSend
+ *    3. ncclIbMultiSend → RDMA WRITE 数据 + RDMA WRITE_WITH_IMM 通知完成
+ *    4. Recv 端 poll CQ 收到 IMM 完成 → ncclIbTest 返回 done
+ *
+ * ====== Week 1 学习路线 ======
+ *
+ *  Q1-Q4:  从 ncclIbIsend/ncclIbMultiSend 开始（数据发送路径）
+ *  Q5-Q7:  看 ncclIbRegMrDmaBuf/ncclIbDeregMr（MR 管理）
+ *  Q8-Q10: 看 ncclIbCreateQp/ncclIbConnect/ncclIbAccept（连接建立）
+ *=======================================================================*/
+
 #include "nccl.h"
 #include "core.h"
 #include "socket.h"
@@ -436,20 +490,27 @@ static_assert(MAX_REQUESTS <= 256, "request id are encoded in wr_id and we need 
 
 #define NCCL_IB_MAX_QPS 128
 
+/*
+ * 【Q10 相关】QP 连接信息：通过 Socket（OOB 通道）在两端之间交换
+ *
+ * 连接建立时，双方各自填好这个结构体，通过 TCP socket 发给对方。
+ * 对方拿到后用 qpn[] 调 ibv_modify_qp(RTR) 建立 QP 连接。
+ * fifoRkey/fifoAddr 是发送端的 FIFO 地址，接收端拿到后可以 RDMA WRITE 通知。
+ */
 struct ncclIbQpInfo {
-  uint32_t lid;
-  uint8_t ib_port;
-  uint8_t link_layer;
-  uint32_t qpn[NCCL_IB_MAX_QPS];
+  uint32_t lid;                     // IB 链路层 LID（仅 IB 链路使用）
+  uint8_t ib_port;                  // IB 端口号
+  uint8_t link_layer;               // 链路类型：IB 或 RoCE(Ethernet)
+  uint32_t qpn[NCCL_IB_MAX_QPS];   // 本端 QP number 数组（对端连接时需要）
 
-  // For RoCE
-  uint64_t spn;
-  uint64_t iid;
-  enum ibv_mtu mtu;
+  // RoCE 专用字段（IB 链路不需要）
+  uint64_t spn;                     // GID subnet prefix
+  uint64_t iid;                     // GID interface id
+  enum ibv_mtu mtu;                 // 协商后的 MTU
 
-  // FIFO RDMA info
-  uint32_t fifoRkey;
-  uint64_t fifoAddr;
+  // 发送端 FIFO 的 RDMA 信息（接收端用来写通知）
+  uint32_t fifoRkey;                // FIFO 内存的 remote key
+  uint64_t fifoAddr;                // FIFO 内存的远端地址
 };
 
 enum ncclIbCommState {
@@ -511,15 +572,37 @@ struct ncclIbListenComm {
   struct ncclIbCommStage stage;
 };
 
+/*
+ * 【Q4 相关】SendFifo 元素：接收端通过 RDMA WRITE 写到发送端的通知条目
+ *
+ * 这是 NCCL FIFO 通知机制的核心数据结构。每当接收端调用 ncclIbIrecv 时，
+ * 它会把自己的缓冲区信息（addr/rkey/size）填入此结构，然后 RDMA WRITE 到
+ * 发送端的 FIFO 中。发送端在 ncclIbIsend 中轮询这个 FIFO，看到 idx 匹配
+ * 后就知道对端已就绪，才执行真正的数据 RDMA WRITE。
+ *
+ * 注意：此结构必须是 32 字节对齐（见下方 static_assert），
+ * 因为开启 IB Relaxed Ordering 时，非对齐写入可能导致条目被拆分写入。
+ */
 struct ncclIbSendFifo {
-  uint64_t addr;
-  int      size;
-  uint32_t rkey;
-  uint32_t nreqs;
-  uint32_t tag;
-  uint64_t idx;
+  uint64_t addr;        // 接收端缓冲区的远端地址（发送端 RDMA WRITE 的目标）
+  int      size;        // 接收端期望的数据大小
+  uint32_t rkey;        // 接收端缓冲区的 remote key
+  uint32_t nreqs;       // 本轮 multi-recv 的请求数量
+  uint32_t tag;         // 消息标签（用于匹配 send/recv 对）
+  uint64_t idx;         // 单调递增索引，发送端用来判断此条目是否有效
 };
 
+/*
+ * 【发送端】Send 侧的连接上下文
+ *
+ * fifo[][]   — 本端 FIFO 缓冲区，接收端通过 RDMA WRITE 把通知写到这里。
+ *              发送端在 ncclIbIsend 中轮询 fifo[slot][0].idx 判断接收端是否就绪。
+ * fifoMr     — fifo 注册的 MR（rkey 在连接建立时发给对端）
+ * qps[]      — 可能有多个 QP（NCCL_IB_QPS_PER_CONNECTION 控制），
+ *              大数据会按 QP 数量做 round-robin 切分
+ * wrs/sges   — 预分配的 WR/SGE 数组，避免热路径上的动态分配
+ * sock       — TCP socket，用于 OOB 连接建立（交换 QP 信息）
+ */
 struct ncclIbSendComm {
   struct ncclIbVerbs verbs;
   struct ncclIbSendFifo fifo[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
@@ -558,6 +641,16 @@ struct ncclIbRemFifo {
   struct ibv_sge sge;
 };
 
+/*
+ * 【接收端】Recv 侧的连接上下文
+ *
+ * remFifo    — 远端（发送端）FIFO 的本地镜像 + RDMA 信息。
+ *              接收端每次 Irecv 时，把 {addr,rkey,size} 填入 remFifo.elems，
+ *              然后 RDMA WRITE 到发送端的 fifo 中。
+ * gpuFlush   — GDR 场景下用 RDMA READ 刷新 GPU 缓存的机制。
+ *              因为 RDMA WRITE 到 GPU 显存后，GPU 不一定立即看到新数据，
+ *              需要一次 RDMA READ 来保证数据可见性（PCIe ordering）。
+ */
 struct ncclIbRecvComm {
   struct ncclIbVerbs verbs;
   struct ncclIbRemFifo remFifo;
@@ -606,29 +699,56 @@ returning:
   return res;
 }
 
+/*
+ * 【Q8 答案】创建 QP 并转到 INIT 状态
+ *
+ * QP 类型：IBV_QPT_RC（Reliable Connection）——和你写 RDMA 应用一样。
+ * RC 提供可靠有序传输，支持 RDMA WRITE/READ，适合大块数据传输。
+ * NCCL 没有用 UD（Unreliable Datagram），因为 UD 不支持 RDMA 操作。
+ *
+ * 【Q9 答案 — 第一步】QP 状态机：RESET → INIT
+ * ibv_create_qp 后 QP 处于 RESET 状态，
+ * 这里立即 modify 到 INIT，指定端口和访问权限。
+ * INIT 状态下 QP 可以 post recv WR，但还不能发送。
+ *
+ * 注意 max_send_wr = 2*MAX_REQUESTS：
+ * 因为每次发送可能包含两个 WR（数据 RDMA_WRITE + 通知 RDMA_WRITE_WITH_IMM）
+ */
 ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbVerbs* verbs, int access_flags, struct ibv_qp** qp) {
   struct ibv_qp_init_attr qpInitAttr;
   memset(&qpInitAttr, 0, sizeof(struct ibv_qp_init_attr));
   qpInitAttr.send_cq = verbs->cq;
   qpInitAttr.recv_cq = verbs->cq;
-  qpInitAttr.qp_type = IBV_QPT_RC;
-  // We might send 2 messages per send (RDMA and RDMA_WITH_IMM)
+  qpInitAttr.qp_type = IBV_QPT_RC;       // 【Q8】RC 类型
   qpInitAttr.cap.max_send_wr = 2*MAX_REQUESTS;
   qpInitAttr.cap.max_recv_wr = MAX_REQUESTS;
   qpInitAttr.cap.max_send_sge = 1;
   qpInitAttr.cap.max_recv_sge = 1;
   qpInitAttr.cap.max_inline_data = ncclParamIbUseInline() ? sizeof(struct ncclIbSendFifo) : 0;
   NCCLCHECK(wrap_ibv_create_qp(qp, verbs->pd, &qpInitAttr));
+
+  // 【Q9 第一步】RESET → INIT
   struct ibv_qp_attr qpAttr;
   memset(&qpAttr, 0, sizeof(struct ibv_qp_attr));
   qpAttr.qp_state = IBV_QPS_INIT;
   qpAttr.pkey_index = ncclParamIbPkey();
   qpAttr.port_num = ib_port;
-  qpAttr.qp_access_flags = access_flags;
+  qpAttr.qp_access_flags = access_flags;  // 通常包含 REMOTE_WRITE（允许对端 RDMA WRITE）
   NCCLCHECK(wrap_ibv_modify_qp(*qp, &qpAttr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS));
   return ncclSuccess;
 }
 
+/*
+ * 【Q9 第二步】INIT → RTR（Ready To Receive）
+ *
+ * 需要对端的 QPN（dest_qp_num）和寻址信息（LID 或 GID）。
+ * 这些信息通过 OOB socket 交换的 ncclIbQpInfo 获得。
+ *
+ * IB 链路：用 LID 寻址（ah_attr.dlid）
+ * RoCE 链路：用 GID 寻址（ah_attr.grh.dgid），需要设 is_global=1
+ *
+ * RTR 状态下 QP 可以接收数据，但还不能发送。
+ */
 ncclResult_t ncclIbRtrQp(struct ibv_qp* qp, uint32_t qpn, struct ncclIbQpInfo* info) {
   struct ibv_qp_attr qpAttr;
   memset(&qpAttr, 0, sizeof(struct ibv_qp_attr));
@@ -657,6 +777,17 @@ ncclResult_t ncclIbRtrQp(struct ibv_qp* qp, uint32_t qpn, struct ncclIbQpInfo* i
   return ncclSuccess;
 }
 
+/*
+ * 【Q9 第三步】RTR → RTS（Ready To Send）
+ *
+ * 设置超时和重试参数后，QP 进入 RTS——此时 QP 全功能可用。
+ * timeout: 重传超时（指数值，18 ≈ 1秒级别）
+ * retry_cnt: 重传次数（7 是默认值）
+ * rnr_retry: RNR（Receiver Not Ready）重试次数（7 = 无限重试）
+ *
+ * 完整状态转换链：RESET → INIT → RTR → RTS
+ * 其中 INIT → RTR 需要对端信息，所以必须在 OOB 交换之后。
+ */
 ncclResult_t ncclIbRtsQp(struct ibv_qp* qp) {
   struct ibv_qp_attr qpAttr;
   memset(&qpAttr, 0, sizeof(struct ibv_qp_attr));
@@ -685,6 +816,23 @@ ncclResult_t ncclIbListen(int dev, void* opaqueHandle, void** listenComm) {
   return ncclSuccess;
 }
 
+/*
+ * 【Q10 答案】发送端连接建立（Connect 侧）
+ *
+ * 这是非阻塞的状态机实现，可能被多次调用直到完成。
+ * 状态转换：Start → Connect(TCP) → Send(QP info) → Connected
+ *
+ * 连接流程：
+ *  1. 通过 TCP socket 连接到接收端的 listen 地址
+ *  2. 创建 QP（INIT 状态）+ 注册 FIFO 的 MR
+ *  3. 把本端的 {QPN, LID/GID, MTU, fifoRkey, fifoAddr} 发给对端
+ *  4. 等待对端回复其 QP 信息（在 ncclSendCheck 中完成 RTR→RTS）
+ *
+ * 关键点：
+ * - 连接建立是通过 TCP socket 做 OOB 交换（类似你用 CM 做连接管理）
+ * - NCCL 不使用 rdma_cm，而是自己实现了更轻量的连接管理
+ * - fifo MR 在这里注册，rkey 发给对端供其 RDMA WRITE 通知
+ */
 ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm) {
   struct ncclIbHandle* handle = (struct ncclIbHandle*) opaqueHandle;
   enum ncclSocketState conState;
@@ -772,6 +920,18 @@ ib_send:
 
 NCCL_PARAM(IbGdrFlushDisable, "GDR_FLUSH_DISABLE", 0);
 
+/*
+ * 【Q10 答案续】接收端连接建立（Accept 侧）
+ *
+ * 非阻塞状态机：Start → Accept(TCP) → Recv(对端QP info) → Send(本端QP info)
+ *
+ * 接收到对端 QP 信息后：
+ *  1. 创建本端 QP
+ *  2. 用对端的 QPN 做 RTR → RTS 状态转换（此时连接建立完成）
+ *  3. 保存对端的 fifoRkey/fifoAddr（后续 ncclIbPostFifo 用于 RDMA WRITE 通知）
+ *  4. 如果支持 GDR，还会创建一个额外的 gpuFlush QP（用于 RDMA READ 刷新 GPU 缓存）
+ *  5. 把本端的 QP 信息发回给对端
+ */
 ncclResult_t ncclIbAccept(void* listenComm, void** recvComm) {
   struct ncclIbListenComm* lComm = (struct ncclIbListenComm*)listenComm;
   struct ncclIbCommStage* stage = &lComm->stage;
@@ -943,7 +1103,28 @@ ncclResult_t ncclRecvCheck(struct ncclIbRecvComm* comm) {
 
 ncclResult_t ncclIbTest(void* request, int* done, int* size);
 
-/* DMA-BUF support */
+/*
+ * 【Q5/Q6 答案】MR 注册（带 DMA-BUF 支持和缓存）
+ *
+ * Q5: ibv_reg_mr 在哪被调用？addr 是 GPU 还是 CPU 地址？
+ *   → 都有可能。data 参数来自上层，可以是：
+ *     - CPU 地址：普通 ibv_reg_mr
+ *     - GPU 地址 + GDR：通过 nvidia-peermem 内核模块，ibv_reg_mr 直接注册 GPU 显存
+ *     - GPU 地址 + DMA-BUF：通过 ibv_reg_dmabuf_mr（新接口，需要内核支持）
+ *
+ * Q6: MR Cache 用什么数据结构？Key 是什么？
+ *   → 线性数组（ncclIbMrCache.slots），以 (addr, pages) 二元组做 key。
+ *     查找时线性遍历，命中则增加引用计数。
+ *     缓存按需增长（初始 capacity=0，首次分配 32 个槽位，之后翻倍）。
+ *
+ * 为什么需要 MR 缓存？
+ *   ibv_reg_mr 非常昂贵（需要 pin 物理页面，可能触发内核页表操作），
+ *   同一块 buffer 被反复发送时，缓存避免了重复注册。
+ *
+ * RELAXED_ORDERING：
+ *   PCIe 放松排序，允许网卡乱序读取内存，可提升 DMA 吞吐。
+ *   需要 IBVERBS_1.8 API（wrap_ibv_reg_mr_iova2）。
+ */
 ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, uint64_t offset, int fd, void** mhandle) {
   static_assert(offsetof(struct ncclIbSendComm, verbs) == offsetof(struct ncclIbRecvComm, verbs), "Send and recv comms must have verbs at the same offset");
   assert(size > 0);
@@ -1005,6 +1186,19 @@ ncclResult_t ncclIbRegMr(void* comm, void* data, int size, int type, void** mhan
   return ncclIbRegMrDmaBuf(comm, data, (size_t)size, type, 0ULL, -1, mhandle);
 }
 
+/*
+ * 【Q7 答案】MR 注销与缓存淘汰
+ *
+ * Q7: MR 什么时候被释放？有淘汰机制吗？
+ *   → 引用计数机制：每次 RegMr 命中缓存则 refs++，DeregMr 则 refs--。
+ *     refs 降到 0 时才真正调 ibv_dereg_mr 释放。
+ *   → 释放后用 memmove 把最后一个槽位搬到空位（保持数组紧凑）。
+ *   → 没有 LRU 或主动淘汰：只在 refs=0 时释放。
+ *
+ * 思考：如果 PyTorch 释放了 tensor 但 MR Cache 还有旧条目？
+ *   → 只要上层正确调用了 DeregMr（通过 proxy 的 deregBuff），
+ *     refs 会降到 0 并释放。但如果上层漏调，MR 会泄漏。
+ */
 ncclResult_t ncclIbDeregMr(void* comm, void* mhandle) {
   struct ncclIbVerbs* verbs = (struct ncclIbVerbs*)comm;
   struct ncclIbMrCache* cache = &ncclIbDevs[verbs->dev].mrCache;
@@ -1032,7 +1226,30 @@ returning:
   return res;
 }
 
-// 【数据面-第一次读】从 reqs/slots 取 buffer、length、rkey/addr，填 ibv_sge/ibv_send_wr，最后 wrap_ibv_post_send(comm->qps[q], comm->wrs, &bad_wr)
+/*
+ * 【Q1/Q2/Q3 答案】真正执行 RDMA WRITE 的函数
+ *
+ * Q1: opcode 是什么？
+ *   → IBV_WR_RDMA_WRITE（数据）+ IBV_WR_RDMA_WRITE_WITH_IMM（完成通知）
+ *   → 为什么不用 SEND？因为 RDMA WRITE 是单边操作，不需要对端 CPU 参与，
+ *     写入直接落到对端内存。SEND 是双边操作，对端需要提前 post recv + 拷贝。
+ *
+ * Q2: sg_list 地址是 GPU 还是 Host？
+ *   → sge.addr = reqs[r]->send.data，来自上层传入的 buffer 地址。
+ *     如果是 GDR 场景，这就是 GPU 显存地址（通过 nvidia-peermem pin 过）。
+ *     sge.lkey 来自 MR 缓存中注册的 lkey。
+ *
+ * Q3: 每次发多大？谁决定切分？
+ *   → size 来自 ncclIbIsend 的参数（上层 proxy 传入）。
+ *     如果有多个 QP（nqps > 1），数据按 QP 数量切分，每个 QP 发 chunkSize。
+ *     chunkSize 按 128B 对齐（LL/LL128 协议要求）。
+ *
+ * 发送策略：
+ *   - 如果数据量 > AR_THRESHOLD 或 multi-recv，先发 RDMA_WRITE（数据），
+ *     再发 0 字节 RDMA_WRITE_WITH_IMM（通知接收端完成）。
+ *     分两步是为了支持自适应路由（Adaptive Routing）。
+ *   - 小数据直接一个 RDMA_WRITE_WITH_IMM 搞定。
+ */
 ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
   volatile struct ncclIbSendFifo* slots = comm->fifo[slot];
@@ -1115,7 +1332,27 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   return ncclSuccess;
 }
 
-// 【数据面-第一次读】net 层 Isend 入口：从 op/conn 取 data、size、mhandle，等对端 recv 就绪后调 ncclIbMultiSend -> ibv_post_send
+/*
+ * 【Q4 答案 + 数据面入口】异步发送：Isend
+ *
+ * Q4: remote_addr 和 rkey 从哪来？
+ *   → 来自 comm->fifo[slot]（即 ncclIbSendFifo）。
+ *     接收端在 ncclIbIrecv 中通过 RDMA WRITE 把 {addr, rkey, size} 写到
+ *     发送端的 fifo。发送端在这里轮询 fifo[slot][0].idx，
+ *     匹配到当前 idx 说明对端已就绪，从 slots[r].addr / slots[r].rkey 取值。
+ *
+ * 整体流程：
+ *   1. 检查连接是否 ready（首次进入时走 ncclSendCheck 完成 RTR→RTS）
+ *   2. 轮询 FIFO：if (slots[0].idx != idx) return（对端未就绪，下次再来）
+ *   3. __sync_synchronize() 保证 idx 读取和后续 addr/rkey 读取的顺序
+ *   4. 构建 request，记录 data/size/lkey
+ *   5. 调 ncclIbMultiSend 执行真正的 RDMA WRITE
+ *   6. 清理 FIFO slot，推进 fifoHead
+ *
+ * 非阻塞设计：
+ *   如果 FIFO 中还没有对端的通知（idx 不匹配），直接返回 *request=NULL，
+ *   上层 proxy 会在下一次 progress 中再调。绝不阻塞等待。
+ */
 ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   if (comm->ready == 0) NCCLCHECK(ncclSendCheck(comm));
@@ -1186,6 +1423,19 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
   return ncclSuccess;
 }
 
+/*
+ * 【FIFO 通知机制】接收端 RDMA WRITE 通知到发送端 FIFO
+ *
+ * 接收端把自己的 {addr, rkey, size, tag, idx} 填入 localElem，
+ * 然后 RDMA WRITE 到发送端的 fifo 地址（remFifo.addr + offset）。
+ * 发送端在 ncclIbIsend 中轮询这个 FIFO 的 idx 字段。
+ *
+ * 关键细节：
+ *   - opcode = IBV_WR_RDMA_WRITE（不带 IMM，不生成对端 CQE）
+ *   - 可能使用 IBV_SEND_INLINE（数据量小时内联到 WR 中，省一次 DMA）
+ *   - 每 MAX_REQUESTS 轮加一次 IBV_SEND_SIGNALED，防止 SQ 积满
+ *     （Unsignaled WR 不生成 CQE，但仍占 SQ 槽位，必须偶尔 signal 一次来清理）
+ */
 ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int* sizes, int* tags, void** mhandles, struct ncclIbRequest* req) {
   struct ibv_send_wr wr;
   memset(&wr, 0, sizeof(wr));
@@ -1246,7 +1496,25 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
   return ncclSuccess;
 }
 
-// 【数据面-第一次读】net 层 Irecv：post recv WR 到 RQ，再 ncclIbPostFifo 通知对端
+/*
+ * 【接收路径】异步接收：Irecv
+ *
+ * 接收端的核心逻辑，分两步：
+ *
+ * 第一步：在 RQ 上 post recv WR
+ *   这里的 recv WR 不携带 buffer（sg_list=NULL, num_sge=0），
+ *   因为真正的数据是通过 RDMA WRITE 直接写入接收缓冲区的。
+ *   post recv 只是为了接收 RDMA_WRITE_WITH_IMM 的完成通知
+ *   （IMM 数据包含传输的数据大小）。
+ *
+ * 第二步：ncclIbPostFifo 通知发送端
+ *   把 {addr, rkey, size, tag, idx} RDMA WRITE 到发送端的 FIFO 中，
+ *   告诉发送端 "我的接收缓冲区已准备好，请往这里写数据"。
+ *
+ * 这种 "先通知再写" 的设计是 NCCL 的精髓：
+ *   传统 RDMA：连接建立时交换 buffer 信息，之后固定使用
+ *   NCCL：每次传输动态交换 buffer 信息，支持不同大小的 buffer
+ */
 ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
   if (comm->ready == 0) NCCLCHECK(ncclRecvCheck(comm));
@@ -1318,6 +1586,25 @@ ncclResult_t ncclIbIflush(void* recvComm, int n, void** data, int* sizes, void**
   return ncclSuccess;
 }
 
+/*
+ * 【完成检测】轮询 CQ 检查操作是否完成
+ *
+ * 被上层 proxy 反复调用，直到 *done=1。
+ *
+ * 工作原理：
+ *   - 每个 request 有 events 计数（初始值 = nqps，多 QP 时 > 1）
+ *   - ibv_poll_cq 取出完成的 WC（Work Completion）
+ *   - 每个 WC 对应一个完成事件，events--
+ *   - 所有 events 降到 0 → 操作完成
+ *
+ * 对于 RECV 类型的请求：
+ *   WC 的 opcode 是 IBV_WC_RECV_RDMA_WITH_IMM（对端 WRITE_WITH_IMM 触发）
+ *   imm_data 携带发送的数据大小
+ *
+ * 对于 SEND 类型的请求：
+ *   WC 的 wr_id 编码了多个 request 的索引（每 8 位一个）
+ *   需要逐个递减每个 sub-request 的 events
+ */
 ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
   struct ncclIbRequest *r = (struct ncclIbRequest*)request;
   *done = 0;
@@ -1413,6 +1700,16 @@ ncclResult_t ncclIbCloseListen(void* listenComm) {
   return ncclSuccess;
 }
 
+/*
+ * 【导出函数表】ncclNet_t 接口实现
+ *
+ * 这是 NCCL 网络插件的标准接口。NCCL 核心通过这个函数指针表
+ * 调用具体的传输实现。除了 IB，NCCL 还有 Socket 传输（net_socket.cc）。
+ *
+ * 函数调用顺序（典型生命周期）：
+ *   init → devices → getProperties → listen/connect/accept
+ *   → regMr → isend/irecv → test → deregMr → close
+ */
 ncclNet_t ncclNetIb = {
   "IB",
   ncclIbInit,
