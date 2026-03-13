@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ring Reduce-Scatter 算法流程</title>
+  <style>
+    :root {
+      --bg: #16161e;
+      --surface: #1a1b26;
+      --surface2: #24283b;
+      --border: #363b54;
+      --text: #a9b1d6;
+      --text-muted: #565f89;
+      --accent: #7aa2f7;
+      --accent-soft: rgba(122, 162, 247, 0.15);
+      --success: #9ece6a;
+      --success-soft: rgba(158, 206, 106, 0.2);
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'SF Pro Text', 'Segoe UI', 'Microsoft YaHei', sans-serif;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      font-size: 15px;
+    }
+    .page-header {
+      margin-bottom: 2rem;
+      text-align: center;
+    }
+    .page-header h1 {
+      font-size: 1.35rem;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: 0.02em;
+      margin: 0 0 0.35rem 0;
+    }
+    .page-header p {
+      color: var(--text-muted);
+      font-size: 0.875rem;
+      margin: 0;
+    }
+
+    /* 主图卡片 */
+    .viz-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2rem;
+      margin-bottom: 1.5rem;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.2);
+    }
+    .ring-container {
+      width: 380px;
+      height: 380px;
+      margin: 0 auto 1.25rem;
+    }
+    .ring-svg { width: 100%; height: 100%; display: block; }
+
+    /* 节点 */
+    .ring-node { cursor: default; }
+    .ring-node .node-bg {
+      fill: var(--surface2);
+      stroke: var(--border);
+      stroke-width: 2;
+      transition: stroke 0.2s, filter 0.2s;
+    }
+    .ring-node.primary .node-bg { stroke: var(--accent); filter: drop-shadow(0 0 8px var(--accent-soft)); }
+    .ring-node .node-label { fill: var(--text); font-weight: 700; font-size: 13px; }
+    .ring-node.primary .node-label { fill: var(--accent); }
+
+    /* 段槽：6 格分成 3 组（块0|块1|块2），组间留白 */
+    .segment-strip { pointer-events: none; }
+    .seg-cell {
+      stroke: var(--bg);
+      stroke-width: 1.5;
+      transition: stroke 0.2s, filter 0.2s, opacity 0.2s;
+    }
+    .seg-cell.seg0 { fill: #7aa2f7; }
+    .seg-cell.seg1 { fill: #9ece6a; }
+    .seg-cell.seg2 { fill: #e0af68; }
+    .seg-cell.seg3 { fill: #f7768e; }
+    .seg-cell.seg4 { fill: #bb9af7; }
+    .seg-cell.seg5 { fill: #7dcfff; }
+    .seg-cell.done {
+      stroke: var(--success);
+      stroke-width: 2.5;
+      filter: brightness(1.1);
+    }
+    .chunk-hint {
+      font-size: 8px;
+      fill: var(--text-muted);
+      text-anchor: middle;
+    }
+
+    /* 边与箭头 */
+    .arrow-path {
+      fill: none;
+      stroke: var(--border);
+      stroke-width: 2;
+      marker-end: url(#arrowhead);
+      opacity: 0.7;
+      transition: all 0.3s;
+    }
+    .edge-group.highlight .arrow-path {
+      stroke: var(--accent);
+      stroke-width: 3;
+      opacity: 1;
+    }
+    .flow-line {
+      fill: none;
+      stroke: #7dcfff;
+      stroke-width: 2;
+      stroke-dasharray: 8 12;
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+    .edge-group.highlight .flow-line {
+      opacity: 0.85;
+      animation: flow 1.2s linear infinite;
+    }
+    @keyframes flow {
+      from { stroke-dashoffset: 0; }
+      to { stroke-dashoffset: -24; }
+    }
+
+    /* 边上的块标签：胶囊形，主行块号 + 副行段号 */
+    .edge-badge {
+      pointer-events: none;
+    }
+    .edge-badge rect {
+      fill: var(--surface2);
+      stroke: var(--border);
+      stroke-width: 1;
+      rx: 6;
+      ry: 6;
+    }
+    .edge-group.highlight .edge-badge rect {
+      fill: var(--accent-soft);
+      stroke: var(--accent);
+    }
+    .edge-badge .badge-main { fill: var(--text); font-weight: 700; font-size: 11px; }
+    .edge-group.highlight .edge-badge .badge-main { fill: var(--accent); }
+    .edge-badge .badge-sub { fill: var(--text-muted); font-size: 9px; }
+
+    /* 图内图例 */
+    .viz-legend {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 1.25rem 1.5rem;
+      padding-top: 0.5rem;
+      border-top: 1px solid var(--border);
+      margin-top: 1rem;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+    .viz-legend span { display: inline-flex; align-items: center; gap: 0.4rem; }
+    .viz-legend .swatch {
+      width: 14px;
+      height: 14px;
+      border-radius: 3px;
+    }
+    .viz-legend .swatch.done { box-shadow: 0 0 0 2px var(--success); }
+
+    /* 轮次选择：分段控件 */
+    .step-control {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      margin-bottom: 1.5rem;
+      padding: 4px;
+      background: var(--surface2);
+      border-radius: 12px;
+      width: fit-content;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .step-btn {
+      padding: 0.5rem 0.9rem;
+      background: transparent;
+      border: none;
+      border-radius: 8px;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .step-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+    .step-btn.active {
+      background: var(--accent);
+      color: var(--bg);
+      font-weight: 600;
+    }
+
+    .round-desc {
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.875rem;
+      margin-bottom: 1.5rem;
+      line-height: 1.5;
+    }
+
+    /* 下方面板 */
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1rem;
+    }
+    .panel h2 {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--text);
+      margin: 0 0 0.75rem 0;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+    th, td {
+      padding: 0.55rem 0.75rem;
+      text-align: center;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background: var(--surface2);
+      color: var(--text-muted);
+      font-weight: 600;
+      font-size: 0.8rem;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255,255,255,0.02); }
+    td.seg0 { background: rgba(122, 162, 247, 0.12); }
+    td.seg1 { background: rgba(158, 206, 106, 0.12); }
+    td.seg2 { background: rgba(224, 175, 104, 0.12); }
+    td.seg3 { background: rgba(247, 118, 142, 0.12); }
+    td.seg4 { background: rgba(187, 154, 246, 0.12); }
+    td.seg5 { background: rgba(125, 207, 255, 0.12); }
+    td.done { font-weight: 600; color: var(--success); }
+    .state-table th:first-child { width: 72px; text-align: left; }
+  </style>
+</head>
+<body>
+  <header class="page-header">
+    <h1>Ring Reduce-Scatter</h1>
+    <p>3 Rank × 6 段 · 块 = 2 段一组沿环传输，段归宿：0,1→R0　2,3→R1　4,5→R2</p>
+  </header>
+
+  <div class="viz-card">
+    <div class="ring-container">
+      <svg class="ring-svg" viewBox="0 0 400 400" id="ringSvg">
+        <defs>
+          <marker id="arrowhead" markerWidth="11" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 11 3.5, 0 7" fill="#7aa2f7" />
+          </marker>
+        </defs>
+        <circle cx="200" cy="200" r="155" fill="none" stroke="var(--border)" stroke-width="1" stroke-dasharray="3 6" opacity="0.5" />
+        <!-- 边 R0→R1（右→下） -->
+        <g class="edge-group" data-edge="01">
+          <path class="arrow-path" d="M 335 200 A 155 155 0 0 1 200 355" />
+          <path class="flow-line" d="M 335 200 A 155 155 0 0 1 200 355" />
+          <g class="edge-badge" id="badge01" transform="translate(310, 310)">
+            <rect x="-24" y="-18" width="48" height="28" />
+            <text class="badge-main" x="0" y="-3" text-anchor="middle">—</text>
+            <text class="badge-sub" x="0" y="8" text-anchor="middle">段·,·</text>
+          </g>
+        </g>
+        <!-- 边 R1→R2（下→左） -->
+        <g class="edge-group" data-edge="12">
+          <path class="arrow-path" d="M 200 355 A 155 155 0 0 1 65 200" />
+          <path class="flow-line" d="M 200 355 A 155 155 0 0 1 65 200" />
+          <g class="edge-badge" id="badge12" transform="translate(90, 310)">
+            <rect x="-24" y="-18" width="48" height="28" />
+            <text class="badge-main" x="0" y="-3" text-anchor="middle">—</text>
+            <text class="badge-sub" x="0" y="8" text-anchor="middle">段·,·</text>
+          </g>
+        </g>
+        <!-- 边 R2→R0（左→右，上方弧）：徽章略靠内，避免顶边突兀 -->
+        <g class="edge-group" data-edge="20">
+          <path class="arrow-path" d="M 65 200 A 155 155 0 0 1 335 200" />
+          <path class="flow-line" d="M 65 200 A 155 155 0 0 1 335 200" />
+          <g class="edge-badge" id="badge20" transform="translate(200, 98)">
+            <rect x="-24" y="-18" width="48" height="28" />
+            <text class="badge-main" x="0" y="-3" text-anchor="middle">—</text>
+            <text class="badge-sub" x="0" y="8" text-anchor="middle">段·,·</text>
+          </g>
+        </g>
+        <!-- 节点：R0 -->
+        <g class="ring-node primary" data-rank="0" transform="translate(335, 200)">
+          <circle class="node-bg" r="42" />
+          <text class="node-label" x="0" y="5" text-anchor="middle">R0</text>
+          <g class="segment-strip">
+            <rect class="seg-cell seg0" data-seg="0" x="-30" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg1" data-seg="1" x="-19" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg2" data-seg="2" x="-5" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg3" data-seg="3" x="6" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg4" data-seg="4" x="13" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg5" data-seg="5" x="24" y="20" width="9" height="10" rx="2" />
+          </g>
+          <text class="chunk-hint" x="-24" y="38">块0</text>
+          <text class="chunk-hint" x="-2" y="38">块1</text>
+          <text class="chunk-hint" x="19" y="38">块2</text>
+        </g>
+        <g class="ring-node" data-rank="1" transform="translate(200, 355)">
+          <circle class="node-bg" r="42" />
+          <text class="node-label" x="0" y="5" text-anchor="middle">R1</text>
+          <g class="segment-strip">
+            <rect class="seg-cell seg0" data-seg="0" x="-30" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg1" data-seg="1" x="-19" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg2" data-seg="2" x="-5" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg3" data-seg="3" x="6" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg4" data-seg="4" x="13" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg5" data-seg="5" x="24" y="20" width="9" height="10" rx="2" />
+          </g>
+          <text class="chunk-hint" x="-24" y="38">块0</text>
+          <text class="chunk-hint" x="-2" y="38">块1</text>
+          <text class="chunk-hint" x="19" y="38">块2</text>
+        </g>
+        <g class="ring-node" data-rank="2" transform="translate(65, 200)">
+          <circle class="node-bg" r="42" />
+          <text class="node-label" x="0" y="5" text-anchor="middle">R2</text>
+          <g class="segment-strip">
+            <rect class="seg-cell seg0" data-seg="0" x="-30" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg1" data-seg="1" x="-19" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg2" data-seg="2" x="-5" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg3" data-seg="3" x="6" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg4" data-seg="4" x="13" y="20" width="9" height="10" rx="2" />
+            <rect class="seg-cell seg5" data-seg="5" x="24" y="20" width="9" height="10" rx="2" />
+          </g>
+          <text class="chunk-hint" x="-24" y="38">块0</text>
+          <text class="chunk-hint" x="-2" y="38">块1</text>
+          <text class="chunk-hint" x="19" y="38">块2</text>
+        </g>
+      </svg>
+    </div>
+    <div class="viz-legend">
+      <span><i class="swatch" style="background:#7aa2f7"></i> 段0</span>
+      <span><i class="swatch" style="background:#9ece6a"></i> 段1</span>
+      <span><i class="swatch" style="background:#e0af68"></i> 段2</span>
+      <span><i class="swatch" style="background:#f7768e"></i> 段3</span>
+      <span><i class="swatch" style="background:#bb9af7"></i> 段4</span>
+      <span><i class="swatch" style="background:#7dcfff"></i> 段5</span>
+      <span><i class="swatch done" style="background:#9ece6a"></i> 已收齐 Sⱼ</span>
+      <span style="color:var(--text-muted)">块0=段0+1　块1=段2+3　块2=段4+5</span>
+    </div>
+  </div>
+
+  <p class="round-desc" id="round-desc"></p>
+
+  <div class="step-control">
+    <button type="button" class="step-btn active" data-round="0">初始</button>
+    <button type="button" class="step-btn" data-round="1">Round 0</button>
+    <button type="button" class="step-btn" data-round="2">Round 1</button>
+    <button type="button" class="step-btn" data-round="3">Round 2</button>
+    <button type="button" class="step-btn" data-round="4">Round 3</button>
+    <button type="button" class="step-btn" data-round="5">结束</button>
+  </div>
+
+  <div class="panel">
+    <h2>本轮发送 / 接收</h2>
+    <table id="sendRecTable">
+      <thead><tr><th>Rank</th><th>发送 →</th><th>接收 ←</th><th>操作</th></tr></thead>
+      <tbody id="sendRecBody"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>各 Rank 段状态</h2>
+    <table class="state-table" id="stateTable">
+      <thead><tr><th>段 \ Rank</th><th>Rank 0</th><th>Rank 1</th><th>Rank 2</th></tr></thead>
+      <tbody id="stateBody"></tbody>
+    </table>
+  </div>
+
+  <script>
+    const ROUNDS = [
+      { desc: '初始：每 Rank 持有 6 段本地值 aⱼ / bⱼ / cⱼ。', send: [], state: [['a₀','b₀','c₀'],['a₁','b₁','c₁'],['a₂','b₂','c₂'],['a₃','b₃','c₃'],['a₄','b₄','c₄'],['a₅','b₅','c₅']], done: [] },
+      { desc: 'Round 0：发块 (i+0) mod 3。R0 发块0(段0,1)→R1，R1 发块1(段2,3)→R2，R2 发块2(段4,5)→R0。', send: [['0','块0(段0,1) → R1','R2 块2','段4:=a₄+c₄，段5:=a₅+c₅'],['1','块1(段2,3) → R2','R0 块0','段0:=a₀+b₀，段1:=a₁+b₁'],['2','块2(段4,5) → R0','R1 块1','段2:=b₂+c₂，段3:=b₃+c₃']], state: [['a₀','a₀+b₀','c₀'],['a₁','a₁+b₁','c₁'],['a₂','b₂','b₂+c₂'],['a₃','b₃','b₃+c₃'],['a₄+c₄','b₄','c₄'],['a₅+c₅','b₅','c₅']], done: [] },
+      { desc: 'Round 1：发块 (i+1) mod 3。段2,3 完整和在 R2；段4,5 在 R1。', send: [['0','块1(段2,3) → R1','R2 块0','段0:=a₀+c₀，段1:=a₁+c₁'],['1','块2(段4,5) → R2','R0 块1','段4:=S₄，段5:=S₅'],['2','块0(段0,1) → R0','R1 块2','段2:=S₂，段3:=S₃']], state: [['a₀+c₀','a₀+b₀','c₀'],['a₁+c₁','a₁+b₁','c₁'],['a₂','a₂+b₂','S₂'],['a₃','a₃+b₃','S₃'],['a₄+c₄','S₄','b₄+c₄'],['a₅+c₅','S₅','b₅+c₅']], done: [[],[4,5],[2,3]] },
+      { desc: 'Round 2：发块 (i+2) mod 3。R0 得 S₂,S₃；R1 得 S₄,S₅；R2 得 S₀,S₁。', send: [['0','块2(段4,5) → R1','R2 块1','段2:=S₂，段3:=S₃'],['1','块0(段0,1) → R2','R0 块2','段4:=S₄，段5:=S₅'],['2','块1(段2,3) → R0','R1 块0','段0:=S₀，段1:=S₁']], state: [['a₀+c₀','a₀+b₀','S₀'],['a₁+c₁','a₁+b₁','S₁'],['S₂','a₂+b₂','S₂'],['S₃','a₃+b₃','S₃'],['a₄+c₄','S₄','b₄+c₄'],['a₅+c₅','S₅','b₅+c₅']], done: [[2,3],[4,5],[0,1]] },
+      { desc: 'Round 3：完整块送归宿。R2→R0 块0，R0→R1 块1，R1→R2 块2。', send: [['0','块1(S₂,S₃) → R1','R2 块0','段0:=S₀，段1:=S₁'],['1','块2(S₄,S₅) → R2','R0 块1','段2:=S₂，段3:=S₃'],['2','块0(S₀,S₁) → R0','R1 块2','段4:=S₄，段5:=S₅']], state: [['S₀','a₀+b₀','S₀'],['S₁','a₁+b₁','S₁'],['S₂','S₂','S₂'],['S₃','S₃','S₃'],['a₄+c₄','S₄','S₄'],['a₅+c₅','S₅','S₅']], done: [[0,1],[2,3],[4,5]] },
+      { desc: 'Reduce-Scatter 结束：段0,1 归 R0；段2,3 归 R1；段4,5 归 R2。', send: [], state: [['S₀','a₀+b₀','S₀'],['S₁','a₁+b₁','S₁'],['S₂','S₂','S₂'],['S₃','S₃','S₃'],['a₄+c₄','S₄','S₄'],['a₅+c₅','S₅','S₅']], done: [[0,1],[2,3],[4,5]] }
+    ];
+
+    const BADGE_MAIN = [
+      ['—','块0','块1','块2','块0→','—'],
+      ['—','块1','块2','块0','块1→','—'],
+      ['—','块2','块0','块1','块2→','—']
+    ];
+    const BADGE_SUB = [
+      ['','段0,1','段2,3','段4,5','段0,1',''],
+      ['','段2,3','段4,5','段0,1','段2,3',''],
+      ['','段4,5','段0,1','段2,3','段4,5','']
+    ];
+
+    function renderRound(roundIndex) {
+      const r = ROUNDS[roundIndex];
+      document.getElementById('round-desc').textContent = r.desc;
+
+      const tbody = document.getElementById('sendRecBody');
+      tbody.innerHTML = r.send.length ? r.send.map(row => `<tr><td>R${row[0]}</td><td>${row[1]}</td><td>${row[2]}</td><td>${row[3]}</td></tr>`).join('') : '<tr><td colspan="4" style="color:var(--text-muted)">—</td></tr>';
+
+      const stateBody = document.getElementById('stateBody');
+      stateBody.innerHTML = '';
+      for (let seg = 0; seg < 6; seg++) {
+        const tr = document.createElement('tr');
+        let html = `<th>段 ${seg}</th>`;
+        for (let rank = 0; rank < 3; rank++) {
+          const val = r.state[seg][rank];
+          const isDone = r.done && r.done[rank] && r.done[rank].indexOf(seg) !== -1;
+          html += `<td class="seg${seg} ${isDone ? 'done' : ''}">${val}</td>`;
+        }
+        tr.innerHTML = html;
+        stateBody.appendChild(tr);
+      }
+
+      document.querySelectorAll('.step-btn').forEach((btn, i) => btn.classList.toggle('active', i === roundIndex));
+      document.querySelectorAll('.ring-node').forEach((g, i) => g.classList.toggle('primary', i === 0));
+
+      document.querySelectorAll('.edge-group').forEach(g => g.classList.remove('highlight'));
+      if (roundIndex >= 1 && roundIndex <= 4) document.querySelectorAll('.edge-group').forEach(g => g.classList.add('highlight'));
+
+      [0, 1, 2].forEach(e => {
+        const badge = document.getElementById('badge' + (e === 0 ? '01' : e === 1 ? '12' : '20'));
+        if (badge) {
+          const main = badge.querySelector('.badge-main'), sub = badge.querySelector('.badge-sub');
+          if (main) main.textContent = BADGE_MAIN[e][roundIndex] || '—';
+          if (sub) sub.textContent = BADGE_SUB[e][roundIndex] || '';
+        }
+      });
+
+      [0, 1, 2].forEach(rank => {
+        [0, 1, 2, 3, 4, 5].forEach(seg => {
+          const cell = document.querySelector(`.ring-node[data-rank="${rank}"] .seg-cell[data-seg="${seg}"]`);
+          if (cell) cell.classList.toggle('done', !!(r.done && r.done[rank] && r.done[rank].indexOf(seg) !== -1));
+        });
+      });
+    }
+
+    document.querySelectorAll('.step-btn').forEach((btn, i) => btn.addEventListener('click', () => renderRound(i)));
+    renderRound(0);
+  </script>
+</body>
+</html>
