@@ -186,3 +186,148 @@ for (int opIndex = state->nextOps; opIndex != -1;) {
 }
 ```
 *注：`__builtin_prefetch` 默认等价于 `__builtin_prefetch(addr, 0, 3)`。参数 0 表示只读不写，参数 3 表示高度局部性（请死死把它留在 L1 Cache 里别踢掉）。在每纳秒必争的高性能轮询中，这一句代码往往能白嫖出极高的性能收益。*
+
+---
+
+## 知识点六：探秘 Proxy 层的多态状态机：`net.cc` 收发闭环
+
+在 Proxy 的光速死循环里，多态函数指针 `op->progress` 针对“网络快递（NET）”专门执行了收发状态机，核心实现在 `src/transport/net.cc` 里的 `sendProxyProgress` 和 `recvProxyProgress`。
+
+### 1. 发送状态机 (`sendProxyProgress`) —— 从 GPU 取货并发往网络
+
+#### 1.1 技术定义
+**一句话概括**：
+一个基于步数 (Steps) 和滑动窗口驱动的异步发送状态机，它负责轮询 GPU 端写入的信箱，将就绪的本地数据通过 `ncclNetIsend` 异步推给网卡，并通过 `ncclNetTest` 非阻塞地回收发送完成事件。
+
+#### 1.2 大白话与物理逻辑
+**大白话**：
+你（Proxy 快递小哥）守在发货流水线旁。你每次跑圈路过，只按顺序干三件事，**绝不傻等**：
+1. **盯源头（GPU）**：看一眼传送带上，老黑工 (GPU) 有没有把新造好的包裹放上来？如果放上来了，你就给它贴个条（记下地址和长度）。
+2. **推给车队（NIC）**：把贴好条的包裹，扔给网卡卡车（调 `Isend` 发车）。
+3. **查回执（CQE）**：回头去查一下之前发走的卡车，对方签收了没（调 `Test`）？签收了就在账本上划掉一笔。
+
+**物理逻辑（流水线与 Steps）**：
+为了让几百 Gbps 的带宽被打满，NCCL 不可能等 1GB 的 Tensor 全算完再发。它把数据切分成多个块（Chunks/Steps），默认最大窗口是 `NCCL_STEPS`（通常是 8 或 64）。
+这三步操作分别对应着状态机里的三个水位线指针：
+- `sub->posted`：表示 Proxy 已经发现 GPU 产出数据的步数。
+- `sub->transmitted`：表示 Proxy 已经成功交给网卡发送的步数。
+- `sub->done`：表示网卡已经彻底发完并收到硬件 CQE 的步数。
+**永远满足：`done <= transmitted <= posted`。**
+
+#### 1.3 代码佐证：三段式水位线推进
+在 `src/transport/net.cc` 的 `sendProxyProgress` 里，有极其工整的三个 `if` 块：
+
+```cpp
+// 动作1：检查能不能继续往下推 (post) 任务
+// posted < done + NCCL_STEPS 控制了滑动窗口不会爆掉
+if (sub->posted < sub->nsteps && sub->posted < sub->done + maxDepth) {
+  // 把 posted 水位线往前推，相当于 Proxy 说：“这批货我接管了”
+  sub->posted += args->sliceSteps; 
+  args->idle = 0; // 只要我推了水位线，我就不算闲着
+  continue;
+}
+
+// 动作2：检查 GPU 数据是否真写进了显存？写进了就交由网卡发送！
+if (sub->transmitted < sub->posted && sub->transmitted < sub->done + NCCL_STEPS) {
+  // sizesFifo 里面记录了 GPU 实际要发的数据大小
+  if (sizesFifo[buffSlot] != -1 && ((*recvTail > (sub->base+sub->transmitted)) || p == NCCL_PROTO_LL)) {
+    // 调底层的 isend！这就是你之前在 net_ib.cc 学的那个口子！
+    NCCLCHECK(ncclNetIsend(comm, resources->netSendComm, buff, size, resources->rank, mhandle, sub->requests+buffSlot));  
+    
+    // 如果发送请求成功提交给网卡了
+    if (sub->requests[buffSlot] != NULL) {
+      sizesFifo[buffSlot] = -1; // 阅后即焚，把信箱清空
+      __sync_synchronize();
+      sub->transmitted += args->sliceSteps; // 推进 transmitted 水位线
+      args->idle = 0;
+      continue;
+    }
+  }
+}
+
+// 动作3：检查之前交给网卡的发送任务，到底发完了没有？
+if (sub->done < sub->transmitted) {
+  int done;
+  // 非阻塞轮询！就是去查 CQE！
+  NCCLCHECK(ncclNetTest(comm, sub->requests[buffSlot], &done, NULL));
+  if (done) {
+    sub->done += args->sliceSteps; // 推进 done 水位线
+    // 通知 GPU：这块显存的数据我发完了，你可以覆盖它写下一批数据了！
+    volatile uint64_t* sendHead = &resources->sendMem->head;
+    *sendHead = sub->base + sub->done;
+    args->idle = 0;
+  }
+}
+```
+
+### 2. 接收状态机 (`recvProxyProgress`) —— 从网卡收货并通知 GPU
+
+#### 2.1 技术定义
+**一句话概括**：
+一个基于预投递机制 (Pre-posted Recv) 的异步接收状态机，它负责提前向下层网卡投递接收描述符 (`ncclNetIrecv`)，在轮询到硬件接收完成 (`ncclNetTest`) 后，通过更新基于共享内存的 `Tail` 指针安全地唤醒 GPU Kernel 消费数据。
+
+#### 2.2 大白话与物理逻辑
+**大白话**：
+收快递和发快递逻辑是反过来的。网卡（快递员）来送货时，你门卫室必须提前准备好空箱子（Recv Buffer），不然货就全掉地上了（这就是网络里的 RNR NAK 报错）。
+所以接收状态机也要干三件事：
+1. **扔空箱子（Irecv）**：只要门卫室还有空地，就疯狂往网卡那里塞空纸箱，告诉网卡“包裹来了放这里”。
+2. **看单子（Test）**：不停地查账本，看看网卡有没有把某个纸箱填满（也就是收到了发送端的 IMM 通知）。
+3. **改公告板（更新 Tail）**：纸箱填满了，你就在大门口的公告板上改个数字（更新 Tail 指针）。老黑工（GPU）一直在盯着公告板，一看到数字变大，立刻扑上来把纸箱里的数据搬走算乘加。
+
+**物理逻辑（防止 RNR 挂死）**：
+在 RDMA 中，接收端必须在发送端发起 WRITE_WITH_IMM 或者 SEND 之前，提前把 Recv WQE（接收工作队列元素）下发到网卡的 RQ 里。所以 `recvProxyProgress` 总是非常激进地把 `sub->posted` 往前推，只要不超过环形队列的深度（`NCCL_STEPS`），它就会把底层的 `Irecv` 塞满。
+
+#### 2.3 代码佐证：接收端的反向流水线
+
+在 `src/transport/net.cc` 的 `recvProxyProgress` 里，同样是经典的三段式推进：
+
+```cpp
+// 动作1：激进地投递接收请求 (Irecv 扔空箱子)
+if (sub->posted < sub->nsteps && sub->posted < sub->done + maxDepth) {
+  // 把空内存地址和长度交给底层网卡
+  NCCLCHECK(ncclNetIrecv(comm, resources->netRecvComm, subCount, ptrs, sizes, tags, mhandles, requestPtr));  
+  if (*requestPtr) {
+    sub->posted += args->sliceSteps;
+    args->idle = 0;
+  }
+}
+
+// 动作2：轮询有没有收到数据
+if (subGroup->posted > subGroup->received) {
+  int done;
+  // 查 CQE，看看带 imm 的包到了没
+  NCCLCHECK(ncclNetTest(comm, subGroup->requests[step%NCCL_STEPS], &done, sizes));
+  if (done) {
+    subGroup->received += args->sliceSteps; // 推进 received 水位线
+    // 【高能联动】：如果开了 GDR，这里就是触发 Loopback QP RDMA READ Flush 的地方！
+    if (useGdr) {
+      NCCLCHECK(ncclNetIflush(comm, resources->netRecvComm, subCount, ptrs, sizes, mhandles, ...));
+    }
+    args->idle = 0;
+  }
+}
+
+// 动作3：数据已经安全落入显存，立刻修改公告板 (Tail) 通知 GPU
+if (subGroup->received > subGroup->transmitted) {
+  int done = 1;
+  // 如果刚才触发了 Iflush，这里还要等 Flush 的 CQE 回来才算数
+  NCCLCHECK(ncclNetTest(comm, request, &done, NULL));
+  if (done) {
+    sub->transmitted += args->sliceSteps;
+    __sync_synchronize(); // 严格的内存屏障
+    // 修改公告板！GPU Kernel 里的 while(*tail < XXX) 瞬间被解阻！
+    volatile uint64_t* recvTail = &resources->recvMem->tail;
+    *recvTail = sub->base + sub->transmitted; 
+    args->idle = 0;
+  }
+}
+```
+
+#### 💡 灵魂拷问：单线程怎么扛得住极高的并发？
+
+无论是 `ncclNetIsend`、`ncclNetIrecv` 还是 `ncclNetTest`，这三个由底层的 `net_ib.cc` 提供的函数，它们**没有任何一个是阻塞的**！
+- 调用 `Isend`，只要网卡 SQ 有空位，立马写一条 WR 进去就返回，绝不等发完。
+- 调用 `Test`，也就是执行底层的 `ibv_poll_cq`，如果硬件没有回执，它直接把 `done` 置为 `0` 然后瞬间返回。
+- 只要 `done == 0`，代码根本不会去推那个水位线（`sub->done += args->sliceSteps`），而是直接跑完这个函数的余下逻辑。
+
+这种“榨干每个 CPU 周期去填补所有的 I/O 等待”的思路，正是高性能网络编程的巅峰浪漫！
