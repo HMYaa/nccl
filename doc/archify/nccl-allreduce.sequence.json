@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "ncclAllReduce 调用序列",
+    "locale": "zh-CN",
+    "output": "nccl-allreduce-sequence.html",
+    "quality_profile": "showcase",
+    "viewBox": [
+      880,
+      500
+    ],
+    "column_fit": "spread",
+    "views": [
+      {
+        "id": "path",
+        "label": "主路径",
+        "focus": [
+          "app",
+          "api",
+          "enqueue",
+          "group",
+          "tune",
+          "gpu"
+        ],
+        "note": "入队 → GroupEnd → 选算法 → Launch；返回只保证 enqueue。"
+      }
+    ]
+  },
+  "participants": [
+    {
+      "id": "app",
+      "type": "external",
+      "label": "App",
+      "sublabel": "框架"
+    },
+    {
+      "id": "api",
+      "type": "frontend",
+      "label": "AllReduce",
+      "sublabel": "API"
+    },
+    {
+      "id": "enqueue",
+      "type": "backend",
+      "label": "Enqueue",
+      "sublabel": "taskAppend"
+    },
+    {
+      "id": "group",
+      "type": "backend",
+      "label": "GroupEnd",
+      "sublabel": "depth→0"
+    },
+    {
+      "id": "tune",
+      "type": "cloud",
+      "label": "Prepare",
+      "sublabel": "GetAlgoInfo"
+    },
+    {
+      "id": "gpu",
+      "type": "cloud",
+      "label": "GPU",
+      "sublabel": "stream"
+    }
+  ],
+  "segments": [
+    {
+      "from": 140,
+      "to": 230,
+      "label": "入队"
+    },
+    {
+      "from": 240,
+      "to": 350,
+      "label": "选算法"
+    },
+    {
+      "from": 360,
+      "to": 440,
+      "label": "Launch"
+    }
+  ],
+  "messages": [
+    {
+      "id": "call",
+      "from": "app",
+      "to": "api",
+      "y": 165,
+      "label": "ncclAllReduce",
+      "variant": "emphasis"
+    },
+    {
+      "id": "enq",
+      "from": "api",
+      "to": "enqueue",
+      "y": 205,
+      "label": "Enqueue + taskAppend",
+      "variant": "emphasis"
+    },
+    {
+      "id": "gend",
+      "from": "enqueue",
+      "to": "group",
+      "y": 255,
+      "label": "GroupEndInternal",
+      "variant": "emphasis"
+    },
+    {
+      "id": "prep",
+      "from": "group",
+      "to": "tune",
+      "y": 295,
+      "label": "PrepareTasks",
+      "variant": "emphasis"
+    },
+    {
+      "id": "algo",
+      "from": "tune",
+      "to": "group",
+      "y": 330,
+      "label": "algo/proto",
+      "variant": "return"
+    },
+    {
+      "id": "launch",
+      "from": "group",
+      "to": "gpu",
+      "y": 375,
+      "label": "LaunchKernel",
+      "variant": "emphasis"
+    },
+    {
+      "id": "ret",
+      "from": "api",
+      "to": "app",
+      "y": 415,
+      "label": "return enqueue",
+      "variant": "return"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "api",
+      "from": 160,
+      "to": 420,
+      "type": "frontend"
+    },
+    {
+      "participant": "enqueue",
+      "from": 200,
+      "to": 270,
+      "type": "backend"
+    },
+    {
+      "participant": "group",
+      "from": 250,
+      "to": 390,
+      "type": "backend"
+    },
+    {
+      "participant": "tune",
+      "from": 290,
+      "to": 340,
+      "type": "cloud"
+    },
+    {
+      "participant": "gpu",
+      "from": 370,
+      "to": 430,
+      "type": "cloud"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "要点",
+      "items": [
+        "单独调用也是 depth=1 隐式 group",
+        "GetAlgoInfo 在 GroupEnd 后；API 返回不保证 GPU 算完"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "NCCL L2 GPU Device Runtime 组件视图",
+    "locale": "zh-CN",
+    "output": "nccl-l2-device-runtime.architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/NVIDIA/nccl",
+      "revision": "7b83616df3ae082a1f32bb74c27458bfe8153a13"
+    },
+    "viewBox": [1390, 760],
+    "views": [
+      {
+        "id": "work-dispatch",
+        "label": "Work 加载与分发",
+        "focus": ["host_launch", "device_work", "kernel_entry", "batch_dispatch", "collective_dispatch"],
+        "note": "Host 上传 ncclDevWorkColl 并 launch kernel；device runtime 按 batch 和 collective 类型分发。"
+      },
+      {
+        "id": "algorithm-protocol",
+        "label": "算法与协议分层",
+        "focus": ["collective_dispatch", "algorithm_layer", "protocol_layer", "buffer_reduction"],
+        "note": "AllReduce 语义进入 Ring/Tree 算法，再调用 Simple/LL/LL128 protocol primitives。"
+      },
+      {
+        "id": "connector-path",
+        "label": "Connector 数据路径",
+        "focus": ["protocol_layer", "buffer_reduction", "connector_fifo", "proxy_runtime", "peer_fabric"],
+        "note": "Primitive 通过 connector/FIFO 与 peer buffer 或 NET 路径协作；Proxy 只通过共享状态参与跨节点推进。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "host_launch",
+      "type": "external",
+      "label": "Host Launch Coordinator",
+      "pos": [20, 160],
+      "size": [150, 75]
+    },
+    {
+      "id": "device_work",
+      "type": "database",
+      "label": "Device Work Buffer",
+      "sublabel": "ncclDevWorkColl",
+      "sources": [
+        {"path": "src/include/device.h", "label": "Device work types"},
+        {"path": "src/enqueue/enqueue.cc", "label": "Work upload"}
+      ],
+      "pos": [200, 150],
+      "size": [180, 95]
+    },
+    {
+      "id": "kernel_entry",
+      "type": "cloud",
+      "label": "Kernel Entry & Loader",
+      "sublabel": "ncclKernelMain",
+      "sources": [
+        {"path": "src/device/common.h", "label": "Kernel entry"}
+      ],
+      "pos": [420, 150],
+      "size": [180, 95]
+    },
+    {
+      "id": "batch_dispatch",
+      "type": "backend",
+      "label": "Work Batch Dispatcher",
+      "sublabel": "RunWorkBatch",
+      "sources": [
+        {"path": "src/device/common.h", "label": "Batch dispatch"}
+      ],
+      "pos": [640, 150],
+      "size": [180, 95]
+    },
+    {
+      "id": "collective_dispatch",
+      "type": "backend",
+      "label": "Collective Dispatcher",
+      "sublabel": "RunWorkColl",
+      "sources": [
+        {"path": "src/device/common.h", "label": "Collective dispatch"}
+      ],
+      "pos": [860, 150],
+      "size": [180, 95]
+    },
+    {
+      "id": "algorithm_layer",
+      "type": "cloud",
+      "label": "Collective Algorithm",
+      "sublabel": "Ring · Tree",
+      "sources": [
+        {"path": "src/device/all_reduce.h", "label": "AllReduce algorithms"}
+      ],
+      "pos": [1080, 150],
+      "size": [180, 95]
+    },
+    {
+      "id": "protocol_layer",
+      "type": "cloud",
+      "label": "Protocol Primitives",
+      "sublabel": "Simple · LL · LL128",
+      "sources": [
+        {"path": "src/device/primitives.h", "label": "Primitive facade"},
+        {"path": "src/device/prims_simple.h", "label": "Simple protocol"},
+        {"path": "src/device/prims_ll128.h", "label": "LL128 protocol"}
+      ],
+      "pos": [1080, 360],
+      "size": [180, 95]
+    },
+    {
+      "id": "buffer_reduction",
+      "type": "database",
+      "label": "Buffers & Reduction",
+      "sublabel": "sendbuff · recvbuff · redOp",
+      "sources": [
+        {"path": "src/device/primitives.h", "label": "Buffer operations"},
+        {"path": "src/include/device.h", "label": "Work operands"}
+      ],
+      "pos": [820, 360],
+      "size": [180, 95]
+    },
+    {
+      "id": "connector_fifo",
+      "type": "messagebus",
+      "label": "Peer Connector & FIFO",
+      "sublabel": "step · head · tail · credits",
+      "sources": [
+        {"path": "src/device/primitives.h", "label": "Connector state"},
+        {"path": "src/include/device.h", "label": "Device connections"}
+      ],
+      "pos": [1080, 520],
+      "size": [180, 95]
+    },
+    {
+      "id": "proxy_runtime",
+      "type": "external",
+      "label": "Proxy Progress Runtime",
+      "pos": [800, 650],
+      "size": [210, 75]
+    },
+    {
+      "id": "peer_fabric",
+      "type": "external",
+      "label": "Peer GPU / NET Path",
+      "pos": [1130, 650],
+      "size": [210, 75]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "L1 Container: GPU Device Runtime",
+      "wraps": ["device_work", "kernel_entry", "batch_dispatch", "collective_dispatch", "algorithm_layer", "protocol_layer", "buffer_reduction", "connector_fifo"],
+      "pad": 22
+    }
+  ],
+  "connections": [
+    {"id": "host_work", "from": "host_launch", "to": "device_work", "label": "upload work", "variant": "emphasis", "labelAt": [185, 265]},
+    {"id": "work_kernel", "from": "device_work", "to": "kernel_entry", "label": "work batches", "variant": "emphasis", "labelAt": [400, 265]},
+    {"id": "kernel_batch", "from": "kernel_entry", "to": "batch_dispatch", "label": "dispatch", "variant": "emphasis", "labelAt": [620, 265]},
+    {"id": "batch_coll", "from": "batch_dispatch", "to": "collective_dispatch", "label": "collective work", "variant": "emphasis", "labelAt": [840, 265]},
+    {"id": "coll_algo", "from": "collective_dispatch", "to": "algorithm_layer", "label": "AllReduce specialization", "variant": "emphasis", "labelAt": [1060, 265]},
+    {"id": "algo_proto", "from": "algorithm_layer", "to": "protocol_layer", "label": "run Ring / Tree", "variant": "emphasis", "labelAt": [1170, 310]},
+    {"id": "buffers_proto", "from": "buffer_reduction", "to": "protocol_layer", "label": "load · reduce · store", "labelAt": [1040, 469]},
+    {"id": "proto_connector", "from": "protocol_layer", "to": "connector_fifo", "label": "recvReduceSend · credits", "variant": "emphasis", "labelAt": [1170, 500]},
+    {"id": "connector_proxy", "from": "connector_fifo", "to": "proxy_runtime", "label": "共享进度状态", "fromSide": "bottom", "toSide": "top", "variant": "dashed"},
+    {"id": "connector_peer", "from": "connector_fifo", "to": "peer_fabric", "label": "P2P / NET buffers", "fromSide": "bottom", "toSide": "top", "variant": "emphasis", "labelAt": [1240, 625]}
+  ]
+}

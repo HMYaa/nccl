@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "NCCL L0 系统上下文",
+    "locale": "zh-CN",
+    "output": "nccl-l0-system-context.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/NVIDIA/nccl",
+      "revision": "7b83616df3ae082a1f32bb74c27458bfe8153a13"
+    },
+    "viewBox": [
+      1160,
+      620
+    ],
+    "views": [
+      {
+        "id": "system-context",
+        "label": "系统上下文",
+        "focus": [
+          "framework",
+          "nccl_system",
+          "cuda",
+          "gpu"
+        ],
+        "note": "训练框架调用分布式 NCCL 子系统，由 CUDA 驱动 GPU 执行。"
+      },
+      {
+        "id": "external-dependencies",
+        "label": "外部依赖",
+        "focus": [
+          "nccl_system",
+          "network",
+          "plugins"
+        ],
+        "note": "跨节点依赖网络 Fabric；插件是可选扩展，不改变系统边界。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "framework",
+      "type": "external",
+      "label": "训练框架 / 应用",
+      "sublabel": "PyTorch · JAX · MPI",
+      "pos": [
+        40,
+        260
+      ],
+      "size": [
+        170,
+        70
+      ]
+    },
+    {
+      "id": "nccl_system",
+      "type": "backend",
+      "label": "分布式 NCCL 子系统",
+      "sublabel": "Rank runtime × nRanks",
+      "tag": "System of Interest",
+      "sources": [
+        {
+          "path": "src/collectives.cc",
+          "label": "Collective API"
+        },
+        {
+          "path": "src/init.cc",
+          "label": "Communicator init"
+        }
+      ],
+      "pos": [
+        290,
+        235
+      ],
+      "size": [
+        220,
+        120
+      ]
+    },
+    {
+      "id": "cuda",
+      "type": "cloud",
+      "label": "CUDA Runtime / Driver",
+      "sublabel": "launch · stream · event",
+      "pos": [
+        590,
+        260
+      ],
+      "size": [
+        180,
+        70
+      ]
+    },
+    {
+      "id": "gpu",
+      "type": "cloud",
+      "label": "GPU 与节点内 Fabric",
+      "sublabel": "NVLink · NVSwitch · PCIe",
+      "pos": [
+        870,
+        260
+      ],
+      "size": [
+        210,
+        70
+      ]
+    },
+    {
+      "id": "network",
+      "type": "messagebus",
+      "label": "NIC 与网络 Fabric",
+      "sublabel": "IB · RoCE",
+      "pos": [
+        590,
+        70
+      ],
+      "size": [
+        210,
+        70
+      ]
+    },
+    {
+      "id": "plugins",
+      "type": "external",
+      "label": "NCCL Extension Plugins",
+      "sublabel": "net · tuner · profiler",
+      "pos": [
+        590,
+        470
+      ],
+      "size": [
+        210,
+        70
+      ]
+    }
+  ],
+  "boundaries": [],
+  "connections": [
+    {
+      "id": "framework-to-nccl",
+      "from": "framework",
+      "to": "nccl_system",
+      "label": "communicator / collective API",
+      "variant": "emphasis",
+      "labelAt": [
+        250,
+        369
+      ]
+    },
+    {
+      "id": "nccl-to-cuda",
+      "from": "nccl_system",
+      "to": "cuda",
+      "label": "kernel launch · stream/event",
+      "labelAt": [
+        550,
+        231
+      ]
+    },
+    {
+      "id": "cuda-to-gpu",
+      "from": "cuda",
+      "to": "gpu",
+      "label": "execute device work"
+    },
+    {
+      "id": "nccl-to-network",
+      "from": "nccl_system",
+      "to": "network",
+      "label": "bootstrap · NET dependency",
+      "fromSide": "top",
+      "toSide": "left"
+    },
+    {
+      "id": "nccl-to-plugins",
+      "from": "nccl_system",
+      "to": "plugins",
+      "label": "dlopen · extension API",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "left"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "系统边界",
+      "items": [
+        "NCCL 是嵌入每个 rank 进程的通信运行时，不是独立集群服务",
+        "所有 rank 的 runtime 共同构成一个逻辑分布式 NCCL 子系统"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "视图边界",
+      "items": [
+        "L0 只描述外部依赖，不展开算法、task、Proxy 或 kernel 内部结构",
+        "Collective API 本身不证明实际 algorithm、protocol 或 transport"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "NCCL L2 GPU Device Runtime 行为序列",
+    "locale": "zh-CN",
+    "output": "nccl-l2-device-runtime.sequence.html",
+    "quality_profile": "showcase",
+    "viewBox": [1390, 760],
+    "column_fit": "spread",
+    "views": [
+      {
+        "id": "dispatch",
+        "label": "Work 分发",
+        "focus": ["host", "work", "kernel", "batch", "collective"],
+        "note": "Host 上传 device work 并启动 kernel；GPU 依次经过 batch 和 collective dispatcher。"
+      },
+      {
+        "id": "ring-simple",
+        "label": "Ring + Simple",
+        "focus": ["collective", "ring", "primitives", "connector", "peer"],
+        "note": "当前行为视图只跟随 Ring + Simple，Tree/LL/LL128 保留为替代实现。"
+      },
+      {
+        "id": "completion",
+        "label": "数据与完成",
+        "focus": ["work", "primitives", "connector", "peer"],
+        "note": "Primitive 等待 credit/step，完成 load/reduce/store 后推进 connector 状态；buffer 复用仍由 stream 完成约束。"
+      }
+    ]
+  },
+  "participants": [
+    {"id": "host", "type": "external", "label": "Host Plan"},
+    {"id": "work", "type": "database", "label": "Work / Buffer"},
+    {"id": "kernel", "type": "cloud", "label": "Kernel Main"},
+    {"id": "batch", "type": "backend", "label": "RunWorkBatch"},
+    {"id": "collective", "type": "backend", "label": "RunWorkColl"},
+    {"id": "ring", "type": "cloud", "label": "Ring"},
+    {"id": "primitives", "type": "cloud", "label": "Simple Prims"},
+    {"id": "connector", "type": "messagebus", "label": "Connector"},
+    {"id": "peer", "type": "external", "label": "Peer / NET"}
+  ],
+  "segments": [
+    {"from": 150, "to": 370, "label": "Device Work 加载与分发"},
+    {"from": 385, "to": 660, "label": "Ring + Simple 数据推进"}
+  ],
+  "messages": [
+    {"id": "upload", "from": "host", "to": "work", "y": 180, "label": "upload ncclDevWorkColl", "variant": "emphasis"},
+    {"id": "launch", "from": "host", "to": "kernel", "y": 215, "label": "ncclLaunchKernel", "variant": "emphasis"},
+    {"id": "load", "from": "kernel", "to": "work", "y": 250, "label": "load work batch", "variant": "default"},
+    {"id": "batch_dispatch", "from": "kernel", "to": "batch", "y": 285, "label": "RunWorkBatch", "variant": "emphasis"},
+    {"id": "coll_dispatch", "from": "batch", "to": "collective", "y": 320, "label": "RunWorkColl", "variant": "emphasis"},
+    {"id": "select_ring", "from": "collective", "to": "ring", "y": 355, "label": "AllReduce Ring specialization", "variant": "emphasis"},
+    {"id": "step_partition", "from": "ring", "to": "primitives", "y": 400, "label": "chunk / slice / step", "variant": "emphasis"},
+    {"id": "wait_credit", "from": "primitives", "to": "connector", "y": 435, "label": "recvReduceSend: wait credit", "variant": "emphasis"},
+    {"id": "peer_io", "from": "connector", "to": "peer", "y": 470, "label": "read / write peer or NET buffer", "variant": "emphasis"},
+    {"id": "peer_ready", "from": "peer", "to": "connector", "y": 505, "label": "remote data / completion", "variant": "return"},
+    {"id": "step_ready", "from": "connector", "to": "primitives", "y": 540, "label": "step ready", "variant": "return"},
+    {"id": "reduce_store", "from": "primitives", "to": "work", "y": 575, "label": "load local + reduce + store", "variant": "emphasis"},
+    {"id": "publish", "from": "primitives", "to": "connector", "y": 610, "label": "publish step / tail", "variant": "dashed"},
+    {"id": "next", "from": "connector", "to": "ring", "y": 645, "label": "next slice / chunk", "variant": "return"}
+  ],
+  "activations": [
+    {"participant": "kernel", "from": 210, "to": 655, "type": "cloud"},
+    {"participant": "batch", "from": 280, "to": 365, "type": "backend"},
+    {"participant": "collective", "from": 315, "to": 365, "type": "backend"},
+    {"participant": "ring", "from": 350, "to": 655, "type": "cloud"},
+    {"participant": "primitives", "from": 395, "to": 620, "type": "cloud"},
+    {"participant": "connector", "from": 430, "to": 650, "type": "messagebus"},
+    {"participant": "peer", "from": 465, "to": 515, "type": "external"}
+  ]
+}

@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "NCCL L2 Proxy Runtime 组件视图",
+    "locale": "zh-CN",
+    "output": "nccl-l2-proxy-runtime.architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/NVIDIA/nccl",
+      "revision": "7b83616df3ae082a1f32bb74c27458bfe8153a13"
+    },
+    "viewBox": [1390, 760],
+    "views": [
+      {
+        "id": "control-rail",
+        "label": "控制面",
+        "focus": ["host_runtime", "proxy_client", "service_thread", "resource_manager", "net_backend"],
+        "note": "Proxy service thread 处理 setup、connect、register 等连接与资源管理请求。"
+      },
+      {
+        "id": "progress-rail",
+        "label": "推进面",
+        "focus": ["host_runtime", "op_submission", "posted_queue", "progress_thread", "active_scheduler", "transport_adapter", "net_backend"],
+        "note": "Collective 的 Proxy op 经 posted queue 进入 progress loop，由 transport callback 推进。"
+      },
+      {
+        "id": "gpu-network",
+        "label": "GPU 与网络协作",
+        "focus": ["active_scheduler", "transport_adapter", "gpu_connector", "net_backend", "nic_fabric"],
+        "note": "Proxy 更新 connector/FIFO 进度并调用 ncclNet；它不是必然经过 CPU buffer 的数据复制引擎。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "host_runtime",
+      "type": "external",
+      "label": "Host NCCL Runtime",
+      "pos": [20, 160],
+      "size": [150, 75]
+    },
+    {
+      "id": "proxy_client",
+      "type": "frontend",
+      "label": "Proxy Client API",
+      "sublabel": "blocking · async",
+      "sources": [
+        {"path": "src/proxy.cc", "label": "Proxy client calls"},
+        {"path": "src/include/proxy.h", "label": "Proxy interface"}
+      ],
+      "pos": [200, 150],
+      "size": [180, 95]
+    },
+    {
+      "id": "service_thread",
+      "type": "backend",
+      "label": "Service Thread",
+      "sublabel": "request dispatch",
+      "sources": [
+        {"path": "src/proxy.cc", "label": "ncclProxyService"}
+      ],
+      "pos": [420, 150],
+      "size": [180, 95]
+    },
+    {
+      "id": "resource_manager",
+      "type": "backend",
+      "label": "Connection & Resources",
+      "sublabel": "setup · connect · register",
+      "sources": [
+        {"path": "src/proxy.cc", "label": "Proxy resources"},
+        {"path": "src/transport/net.cc", "label": "NET setup"}
+      ],
+      "pos": [640, 150],
+      "size": [180, 95]
+    },
+    {
+      "id": "net_backend",
+      "type": "external",
+      "label": "ncclNet Backend",
+      "pos": [900, 160],
+      "size": [190, 75]
+    },
+    {
+      "id": "nic_fabric",
+      "type": "external",
+      "label": "NIC / Network Fabric",
+      "pos": [1160, 160],
+      "size": [200, 75]
+    },
+    {
+      "id": "op_submission",
+      "type": "frontend",
+      "label": "Operation Submission",
+      "sublabel": "save · post · start",
+      "sources": [
+        {"path": "src/proxy.cc", "label": "Save and post ops"}
+      ],
+      "pos": [200, 380],
+      "size": [180, 95]
+    },
+    {
+      "id": "posted_queue",
+      "type": "messagebus",
+      "label": "Posted Operation Queue",
+      "sublabel": "shared op pool",
+      "sources": [
+        {"path": "src/proxy.cc", "label": "Posted ops"}
+      ],
+      "pos": [420, 380],
+      "size": [180, 95]
+    },
+    {
+      "id": "progress_thread",
+      "type": "backend",
+      "label": "Progress Thread",
+      "sublabel": "progress loop",
+      "sources": [
+        {"path": "src/proxy.cc", "label": "ncclProxyProgress"}
+      ],
+      "pos": [640, 380],
+      "size": [180, 95]
+    },
+    {
+      "id": "active_scheduler",
+      "type": "backend",
+      "label": "Active Op Scheduler",
+      "sublabel": "ncclProxyArgs states",
+      "sources": [
+        {"path": "src/proxy.cc", "label": "progressOps"}
+      ],
+      "pos": [860, 380],
+      "size": [180, 95]
+    },
+    {
+      "id": "transport_adapter",
+      "type": "backend",
+      "label": "Transport Progress",
+      "sublabel": "send / recv callbacks",
+      "sources": [
+        {"path": "src/transport/net.cc", "label": "NET progress"}
+      ],
+      "pos": [1080, 380],
+      "size": [180, 95]
+    },
+    {
+      "id": "gpu_connector",
+      "type": "external",
+      "label": "GPU Connector / FIFO",
+      "pos": [850, 650],
+      "size": [210, 75]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "L1 Container: Proxy Progress Runtime",
+      "wraps": ["proxy_client", "service_thread", "resource_manager", "op_submission", "posted_queue", "progress_thread", "active_scheduler", "transport_adapter"],
+      "pad": 22
+    }
+  ],
+  "connections": [
+    {"id": "host_client", "from": "host_runtime", "to": "proxy_client", "label": "blocking / async RPC", "variant": "emphasis", "labelAt": [260, 300]},
+    {"id": "client_service", "from": "proxy_client", "to": "service_thread", "label": "control request", "variant": "emphasis", "labelAt": [400, 265]},
+    {"id": "service_resources", "from": "service_thread", "to": "resource_manager", "label": "dispatch", "variant": "emphasis", "labelAt": [620, 265]},
+    {"id": "resources_net", "from": "resource_manager", "to": "net_backend", "label": "setup · connect · regMr", "labelAt": [860, 259]},
+    {"id": "net_nic", "from": "net_backend", "to": "nic_fabric", "label": "IB / RoCE"},
+    {"id": "host_submit", "from": "host_runtime", "to": "op_submission", "label": "Proxy op", "fromSide": "bottom", "toSide": "left", "variant": "emphasis"},
+    {"id": "submit_queue", "from": "op_submission", "to": "posted_queue", "label": "posted op", "variant": "emphasis", "labelAt": [400, 495]},
+    {"id": "queue_progress", "from": "posted_queue", "to": "progress_thread", "label": "get posted ops", "variant": "emphasis", "labelAt": [620, 495]},
+    {"id": "progress_active", "from": "progress_thread", "to": "active_scheduler", "label": "progressOps", "variant": "emphasis", "labelAt": [840, 495]},
+    {"id": "active_transport", "from": "active_scheduler", "to": "transport_adapter", "label": "progress callback", "variant": "emphasis", "labelAt": [1060, 495]},
+    {"id": "transport_net", "from": "transport_adapter", "to": "net_backend", "label": "isend · irecv · test", "fromSide": "top", "toSide": "bottom", "variant": "emphasis"},
+    {"id": "active_gpu", "from": "active_scheduler", "to": "gpu_connector", "label": "step · head · tail", "fromSide": "bottom", "toSide": "top", "variant": "dashed"}
+  ]
+}

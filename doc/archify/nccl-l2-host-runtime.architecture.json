@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "NCCL L2 Host Runtime 组件视图",
+    "locale": "zh-CN",
+    "output": "nccl-l2-host-runtime.architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/NVIDIA/nccl",
+      "revision": "7b83616df3ae082a1f32bb74c27458bfe8153a13"
+    },
+    "viewBox": [1390, 760],
+    "views": [
+      {
+        "id": "init-path",
+        "label": "Communicator 初始化",
+        "focus": ["comm_init", "topology_graph", "planner", "tuning"],
+        "note": "初始化期发现物理拓扑、计算路径并保存可供后续调度使用的图与 communicator 状态。"
+      },
+      {
+        "id": "collective-path",
+        "label": "Collective 入队",
+        "focus": ["app", "api_validation", "group_lifecycle", "task_admission", "planner"],
+        "note": "一次 AllReduce 先形成 ncclInfo，再持久化为 planner 持有的 ncclTaskColl。"
+      },
+      {
+        "id": "launch-path",
+        "label": "计划与提交",
+        "focus": ["planner", "tuning", "work_builder", "launch", "proxy_runtime", "gpu_runtime"],
+        "note": "Planner 依据 communicator 状态完成 tuning、work/plan 构建，并在 Group 收口时提交 Proxy 与 GPU 工作。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "app",
+      "type": "external",
+      "label": "训练框架 / 应用",
+      "pos": [20, 160],
+      "size": [150, 75]
+    },
+    {
+      "id": "api_validation",
+      "type": "frontend",
+      "label": "API & Validation",
+      "sublabel": "ncclInfo · checks",
+      "sources": [
+        {"path": "src/collectives.cc", "label": "Collective API"},
+        {"path": "src/include/info.h", "label": "ncclInfo"},
+        {"path": "src/enqueue/enqueue.cc", "label": "Enqueue checks"}
+      ],
+      "pos": [200, 150],
+      "size": [180, 95]
+    },
+    {
+      "id": "group_lifecycle",
+      "type": "backend",
+      "label": "Group Lifecycle",
+      "sublabel": "nesting · submit",
+      "sources": [
+        {"path": "src/group.cc", "label": "Group lifecycle"},
+        {"path": "src/include/group.h", "label": "Group state"}
+      ],
+      "pos": [420, 150],
+      "size": [180, 95]
+    },
+    {
+      "id": "task_admission",
+      "type": "backend",
+      "label": "Task Admission",
+      "sublabel": "info → task",
+      "sources": [
+        {"path": "src/enqueue/enqueue.cc", "label": "Task admission"},
+        {"path": "src/include/comm.h", "label": "ncclTaskColl"}
+      ],
+      "pos": [640, 150],
+      "size": [180, 95]
+    },
+    {
+      "id": "planner",
+      "type": "backend",
+      "label": "Planner & Task Queues",
+      "sublabel": "sorter · pending work",
+      "sources": [
+        {"path": "src/enqueue/enqueue.cc", "label": "Planner flow"},
+        {"path": "src/include/comm.h", "label": "ncclKernelPlanner"}
+      ],
+      "pos": [860, 150],
+      "size": [180, 95]
+    },
+    {
+      "id": "tuning",
+      "type": "cloud",
+      "label": "Tuning & Cost Selection",
+      "sublabel": "algorithm · protocol · channels",
+      "sources": [
+        {"path": "src/enqueue/enqueue.cc", "label": "ncclGetAlgoInfo"},
+        {"path": "src/tuning/tuning.cc", "label": "Cost model"}
+      ],
+      "pos": [860, 360],
+      "size": [180, 95]
+    },
+    {
+      "id": "work_builder",
+      "type": "backend",
+      "label": "Work & Plan Builder",
+      "sublabel": "device work · kernel plan",
+      "sources": [
+        {"path": "src/enqueue/enqueue.cc", "label": "Work scheduling"},
+        {"path": "src/include/device.h", "label": "Device work"},
+        {"path": "src/include/comm.h", "label": "Kernel plan"}
+      ],
+      "pos": [1080, 360],
+      "size": [180, 95]
+    },
+    {
+      "id": "comm_init",
+      "type": "backend",
+      "label": "Communicator Init & State",
+      "sublabel": "bootstrap · state · pools",
+      "sources": [
+        {"path": "src/init.cc", "label": "Communicator init"},
+        {"path": "src/include/comm.h", "label": "Communicator state"}
+      ],
+      "pos": [200, 360],
+      "size": [200, 95]
+    },
+    {
+      "id": "topology_graph",
+      "type": "cloud",
+      "label": "Topology & Graph Builder",
+      "sublabel": "system · paths · graphs",
+      "sources": [
+        {"path": "src/graph/topo.cc", "label": "Topology system"},
+        {"path": "src/graph/paths.cc", "label": "Path computation"},
+        {"path": "src/graph/search.cc", "label": "Graph search"}
+      ],
+      "pos": [450, 360],
+      "size": [220, 95]
+    },
+    {
+      "id": "launch",
+      "type": "backend",
+      "label": "Launch Coordinator",
+      "sublabel": "GroupEnd · Proxy · CUDA",
+      "sources": [
+        {"path": "src/group.cc", "label": "Group launch"},
+        {"path": "src/enqueue/enqueue.cc", "label": "Kernel launch"}
+      ],
+      "pos": [1080, 500],
+      "size": [180, 95]
+    },
+    {
+      "id": "proxy_runtime",
+      "type": "external",
+      "label": "Proxy Progress Runtime",
+      "pos": [800, 650],
+      "size": [200, 75]
+    },
+    {
+      "id": "gpu_runtime",
+      "type": "external",
+      "label": "GPU Device Runtime",
+      "pos": [1150, 650],
+      "size": [200, 75]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "L1 Container: Host NCCL Runtime",
+      "wraps": ["api_validation", "group_lifecycle", "task_admission", "planner", "tuning", "work_builder", "comm_init", "topology_graph", "launch"],
+      "pad": 22
+    }
+  ],
+  "connections": [
+    {"id": "app_api", "from": "app", "to": "api_validation", "label": "ncclAllReduce", "variant": "emphasis", "labelAt": [185, 265]},
+    {"id": "api_group", "from": "api_validation", "to": "group_lifecycle", "label": "内部 Group", "variant": "emphasis", "labelAt": [400, 265]},
+    {"id": "group_task", "from": "group_lifecycle", "to": "task_admission", "label": "validated ncclInfo", "variant": "emphasis", "labelAt": [620, 265]},
+    {"id": "task_planner", "from": "task_admission", "to": "planner", "label": "ncclTaskColl", "variant": "emphasis", "labelAt": [840, 265]},
+    {"id": "planner_tuning", "from": "planner", "to": "tuning", "label": "候选与约束", "variant": "emphasis", "labelAt": [950, 310]},
+    {"id": "tuning_work", "from": "tuning", "to": "work_builder", "label": "algo · proto · channels", "variant": "emphasis", "labelAt": [1060, 475]},
+    {"id": "work_launch", "from": "work_builder", "to": "launch", "label": "kernel plans", "variant": "emphasis", "labelAt": [1170, 469]},
+    {"id": "init_topology", "from": "comm_init", "to": "topology_graph", "label": "硬件发现输入", "labelAt": [425, 475]},
+    {"id": "topology_tuning", "from": "topology_graph", "to": "tuning", "label": "graphs · paths"},
+    {"id": "launch_proxy", "from": "launch", "to": "proxy_runtime", "label": "Proxy ops", "fromSide": "bottom", "toSide": "top"},
+    {"id": "launch_gpu", "from": "launch", "to": "gpu_runtime", "label": "CUDA launch · work", "fromSide": "bottom", "toSide": "top", "variant": "emphasis", "labelAt": [1240, 625]}
+  ]
+}

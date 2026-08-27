@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "NCCL L2 Proxy Runtime 行为序列",
+    "locale": "zh-CN",
+    "output": "nccl-l2-proxy-runtime.sequence.html",
+    "quality_profile": "showcase",
+    "viewBox": [1390, 760],
+    "column_fit": "spread",
+    "views": [
+      {
+        "id": "setup",
+        "label": "连接与资源控制",
+        "focus": ["host", "client", "service", "net"],
+        "note": "Service thread 接收 blocking/async 请求，调用 transport setup/connect/register 并返回资源句柄。"
+      },
+      {
+        "id": "progress",
+        "label": "Operation 推进",
+        "focus": ["host", "posted", "progress", "active", "adapter", "net", "gpu"],
+        "note": "Progress thread 消费 posted ops，调用 send/recv progress callback，直到 operation 完成。"
+      }
+    ]
+  },
+  "participants": [
+    {"id": "host", "type": "external", "label": "Host"},
+    {"id": "client", "type": "frontend", "label": "Proxy Client"},
+    {"id": "service", "type": "backend", "label": "Service"},
+    {"id": "posted", "type": "messagebus", "label": "Posted Ops"},
+    {"id": "progress", "type": "backend", "label": "Progress"},
+    {"id": "active", "type": "backend", "label": "Active Ops"},
+    {"id": "adapter", "type": "backend", "label": "NET Progress"},
+    {"id": "net", "type": "external", "label": "ncclNet"},
+    {"id": "gpu", "type": "external", "label": "GPU Connector"}
+  ],
+  "segments": [
+    {"from": 150, "to": 335, "label": "Service Thread 控制面"},
+    {"from": 350, "to": 665, "label": "Progress Thread 推进面"}
+  ],
+  "messages": [
+    {"id": "control_call", "from": "host", "to": "client", "y": 180, "label": "ncclProxyCallBlocking / Async", "variant": "emphasis"},
+    {"id": "dispatch", "from": "client", "to": "service", "y": 215, "label": "enqueue control request", "variant": "emphasis"},
+    {"id": "resource_op", "from": "service", "to": "net", "y": 250, "label": "setup / connect / register", "variant": "emphasis"},
+    {"id": "net_handle", "from": "net", "to": "service", "y": 285, "label": "connection / MR handle", "variant": "return"},
+    {"id": "control_done", "from": "service", "to": "client", "y": 320, "label": "response ready", "variant": "return"},
+    {"id": "save_op", "from": "host", "to": "posted", "y": 370, "label": "ncclProxySaveOp / Post", "variant": "emphasis"},
+    {"id": "get_posted", "from": "posted", "to": "progress", "y": 405, "label": "ncclProxyGetPostedOps", "variant": "emphasis"},
+    {"id": "activate", "from": "progress", "to": "active", "y": 440, "label": "progressOps(active list)", "variant": "default"},
+    {"id": "progress_cb", "from": "active", "to": "adapter", "y": 475, "label": "sendProxyProgress / recvProxyProgress", "variant": "emphasis"},
+    {"id": "net_request", "from": "adapter", "to": "net", "y": 510, "label": "isend / irecv / test", "variant": "emphasis"},
+    {"id": "request_state", "from": "net", "to": "adapter", "y": 545, "label": "request completion state", "variant": "return"},
+    {"id": "connector_state", "from": "adapter", "to": "gpu", "y": 580, "label": "更新 step / head / tail", "variant": "dashed"},
+    {"id": "poll_again", "from": "adapter", "to": "progress", "y": 615, "label": "pending 或 done", "variant": "return"},
+    {"id": "op_complete", "from": "progress", "to": "host", "y": 650, "label": "operation 可回收", "variant": "return"}
+  ],
+  "activations": [
+    {"participant": "client", "from": 175, "to": 330, "type": "frontend"},
+    {"participant": "service", "from": 210, "to": 330, "type": "backend"},
+    {"participant": "progress", "from": 400, "to": 660, "type": "backend"},
+    {"participant": "active", "from": 435, "to": 625, "type": "backend"},
+    {"participant": "adapter", "from": 470, "to": 625, "type": "backend"},
+    {"participant": "net", "from": 505, "to": 555, "type": "external"}
+  ]
+}

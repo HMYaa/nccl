@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "NCCL L2 Host Runtime 行为序列",
+    "locale": "zh-CN",
+    "output": "nccl-l2-host-runtime.sequence.html",
+    "quality_profile": "showcase",
+    "viewBox": [1390, 770],
+    "column_fit": "spread",
+    "views": [
+      {
+        "id": "initialization",
+        "label": "初始化期",
+        "focus": ["app", "comm", "topology", "planner"],
+        "note": "Communicator 初始化一次性建立拓扑、路径与算法图，并把结果保存为后续调度输入。"
+      },
+      {
+        "id": "enqueue",
+        "label": "API 到 Task",
+        "focus": ["app", "api", "group", "planner"],
+        "note": "AllReduce 请求经 ncclInfo 和 ncclTaskColl 进入 planner；此时没有证明 kernel 已启动。"
+      },
+      {
+        "id": "planning",
+        "label": "Tuning 与 Launch",
+        "focus": ["planner", "tuning", "group", "proxy", "gpu"],
+        "note": "Group 收口后才完成候选选择、work/plan 构建，并分别提交 Proxy 和 GPU 工作。"
+      }
+    ]
+  },
+  "participants": [
+    {"id": "app", "type": "external", "label": "App"},
+    {"id": "api", "type": "frontend", "label": "API"},
+    {"id": "group", "type": "backend", "label": "Group"},
+    {"id": "comm", "type": "backend", "label": "Communicator"},
+    {"id": "topology", "type": "cloud", "label": "Topology"},
+    {"id": "planner", "type": "backend", "label": "Planner"},
+    {"id": "tuning", "type": "cloud", "label": "Tuning"},
+    {"id": "proxy", "type": "external", "label": "Proxy"},
+    {"id": "gpu", "type": "external", "label": "GPU"}
+  ],
+  "segments": [
+    {"from": 150, "to": 315, "label": "Communicator 初始化"},
+    {"from": 325, "to": 475, "label": "Collective 入队"},
+    {"from": 485, "to": 690, "label": "规划与提交"}
+  ],
+  "messages": [
+    {"id": "comm_init", "from": "app", "to": "comm", "y": 180, "label": "ncclCommInitRank", "variant": "emphasis"},
+    {"id": "topo_get", "from": "comm", "to": "topology", "y": 210, "label": "ncclTopoGetSystem", "variant": "emphasis"},
+    {"id": "topo_paths", "from": "comm", "to": "topology", "y": 240, "label": "ncclTopoComputePaths"},
+    {"id": "topo_graph", "from": "comm", "to": "topology", "y": 270, "label": "ncclTopoCompute Ring / Tree"},
+    {"id": "topo_ready", "from": "topology", "to": "planner", "y": 300, "label": "graphs + path constraints", "variant": "return"},
+    {"id": "allreduce", "from": "app", "to": "api", "y": 340, "label": "ncclAllReduce", "variant": "emphasis"},
+    {"id": "enqueue", "from": "api", "to": "group", "y": 370, "label": "ncclEnqueueCheck(ncclInfo)", "variant": "emphasis"},
+    {"id": "task", "from": "group", "to": "planner", "y": 400, "label": "collTaskAppend → ncclTaskColl", "variant": "emphasis"},
+    {"id": "queued", "from": "planner", "to": "group", "y": 430, "label": "task 已入队", "variant": "return"},
+    {"id": "group_close", "from": "api", "to": "group", "y": 460, "label": "GroupEndInternal · depth→0", "variant": "emphasis"},
+    {"id": "prepare", "from": "group", "to": "planner", "y": 490, "label": "ncclPrepareTasks", "variant": "emphasis"},
+    {"id": "select", "from": "planner", "to": "tuning", "y": 520, "label": "ncclGetAlgoInfo", "variant": "emphasis"},
+    {"id": "choice", "from": "tuning", "to": "planner", "y": 550, "label": "algo / proto / channels", "variant": "return"},
+    {"id": "plan", "from": "planner", "to": "group", "y": 580, "label": "device work + kernel plans", "variant": "return"},
+    {"id": "proxy_start", "from": "group", "to": "proxy", "y": 610, "label": "提交 Proxy ops", "variant": "default"},
+    {"id": "kernel_launch", "from": "group", "to": "gpu", "y": 640, "label": "ncclLaunchKernel", "variant": "emphasis"},
+    {"id": "host_return", "from": "api", "to": "app", "y": 670, "label": "Host 返回；stream 工作可仍在执行", "variant": "return"}
+  ],
+  "activations": [
+    {"participant": "comm", "from": 175, "to": 305, "type": "backend"},
+    {"participant": "topology", "from": 205, "to": 305, "type": "cloud"},
+    {"participant": "api", "from": 335, "to": 675, "type": "frontend"},
+    {"participant": "group", "from": 365, "to": 650, "type": "backend"},
+    {"participant": "planner", "from": 395, "to": 590, "type": "backend"},
+    {"participant": "tuning", "from": 515, "to": 558, "type": "cloud"}
+  ]
+}

@@ -1,0 +1,291 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "NCCL L1 Rank Runtime 容器视图",
+    "locale": "zh-CN",
+    "output": "nccl-l1-control-data-plane.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/NVIDIA/nccl",
+      "revision": "7b83616df3ae082a1f32bb74c27458bfe8153a13"
+    },
+    "viewBox": [
+      1320,
+      760
+    ],
+    "views": [
+      {
+        "id": "rank-runtime",
+        "label": "Rank Runtime",
+        "focus": [
+          "framework",
+          "host_runtime",
+          "gpu_runtime"
+        ],
+        "note": "每个 rank 复制一份 Host 与 GPU runtime；Host 经 CUDA 提交 device work。"
+      },
+      {
+        "id": "proxy-progress",
+        "label": "Proxy Progress",
+        "focus": [
+          "host_runtime",
+          "gpu_runtime",
+          "proxy_runtime",
+          "plugins"
+        ],
+        "note": "Proxy 通过 connector/FIFO 状态与 GPU 协作，并调用 NET 插件推进请求。"
+      },
+      {
+        "id": "network-paths",
+        "label": "Local / Cross-node",
+        "focus": [
+          "gpu_runtime",
+          "gpu_fabric",
+          "plugins",
+          "network"
+        ],
+        "note": "节点内使用 GPU Fabric；跨节点由 NET backend 与可选 GDR DMA 承载。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "framework",
+      "type": "external",
+      "label": "训练框架 / 应用",
+      "sublabel": "collective caller",
+      "pos": [
+        30,
+        235
+      ],
+      "size": [
+        170,
+        70
+      ]
+    },
+    {
+      "id": "host_runtime",
+      "type": "backend",
+      "label": "Host NCCL Runtime",
+      "sublabel": "API · comm · planner · tuning",
+      "tag": "per rank",
+      "sources": [
+        {
+          "path": "src/collectives.cc",
+          "label": "Host API"
+        },
+        {
+          "path": "src/enqueue/enqueue.cc",
+          "label": "Planner and tuning"
+        },
+        {
+          "path": "src/init.cc",
+          "label": "Communicator init"
+        }
+      ],
+      "pos": [
+        280,
+        220
+      ],
+      "size": [
+        220,
+        100
+      ]
+    },
+    {
+      "id": "gpu_runtime",
+      "type": "cloud",
+      "label": "GPU Device Runtime",
+      "sublabel": "kernels · device primitives",
+      "tag": "per rank",
+      "sources": [
+        {
+          "path": "src/device/all_reduce.h",
+          "label": "AllReduce kernels"
+        },
+        {
+          "path": "src/device/primitives.h",
+          "label": "Device primitives"
+        }
+      ],
+      "pos": [
+        760,
+        220
+      ],
+      "size": [
+        220,
+        100
+      ]
+    },
+    {
+      "id": "proxy_runtime",
+      "type": "backend",
+      "label": "Proxy Progress Runtime",
+      "sublabel": "Host progress threads",
+      "tag": "as needed",
+      "sources": [
+        {
+          "path": "src/proxy.cc",
+          "label": "Proxy progress"
+        }
+      ],
+      "pos": [
+        520,
+        410
+      ],
+      "size": [
+        200,
+        80
+      ]
+    },
+    {
+      "id": "gpu_fabric",
+      "type": "cloud",
+      "label": "GPU / Local Fabric",
+      "sublabel": "NVLink · NVSwitch · PCIe",
+      "pos": [
+        1060,
+        232.5
+      ],
+      "size": [
+        190,
+        75
+      ]
+    },
+    {
+      "id": "plugins",
+      "type": "external",
+      "label": "Loaded Plugins",
+      "sublabel": "net · tuner · profiler",
+      "sources": [
+        {
+          "path": "src/plugin/net.cc",
+          "label": "Network plugins"
+        }
+      ],
+      "pos": [
+        520,
+        610
+      ],
+      "size": [
+        200,
+        75
+      ]
+    },
+    {
+      "id": "network",
+      "type": "messagebus",
+      "label": "NIC / Network Fabric",
+      "sublabel": "IB · RoCE",
+      "pos": [
+        850,
+        610
+      ],
+      "size": [
+        200,
+        75
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "NCCL Rank Runtime Template × nRanks",
+      "wraps": [
+        "host_runtime",
+        "gpu_runtime",
+        "proxy_runtime"
+      ],
+      "pad": 24
+    }
+  ],
+  "connections": [
+    {
+      "id": "framework-to-host",
+      "from": "framework",
+      "to": "host_runtime",
+      "label": "Host API",
+      "variant": "emphasis"
+    },
+    {
+      "id": "host-to-device",
+      "from": "host_runtime",
+      "to": "gpu_runtime",
+      "label": "CUDA launch · work submission",
+      "variant": "emphasis"
+    },
+    {
+      "id": "host-to-proxy",
+      "from": "host_runtime",
+      "to": "proxy_runtime",
+      "label": "setup · enqueue progress",
+      "fromSide": "bottom",
+      "toSide": "left"
+    },
+    {
+      "id": "device-to-proxy",
+      "from": "gpu_runtime",
+      "to": "proxy_runtime",
+      "label": "connector / FIFO state",
+      "fromSide": "bottom",
+      "toSide": "right"
+    },
+    {
+      "id": "proxy-to-plugins",
+      "from": "proxy_runtime",
+      "to": "plugins",
+      "label": "ncclNet requests",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        620,
+        504
+      ]
+    },
+    {
+      "id": "plugins-to-network",
+      "from": "plugins",
+      "to": "network",
+      "label": "NET backend"
+    },
+    {
+      "id": "device-to-fabric",
+      "from": "gpu_runtime",
+      "to": "gpu_fabric",
+      "label": "P2P · NVLink/NVSwitch",
+      "route": "orthogonal-h",
+      "labelAt": [
+        1020,
+        360
+      ]
+    },
+    {
+      "id": "device-to-network",
+      "from": "gpu_runtime",
+      "to": "network",
+      "label": "GDR DMA if available",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Host Runtime 职责",
+      "items": [
+        "communicator 内部持有 topology、algorithm graphs、planner 与 tuning 状态",
+        "这些是进程内结构，不是独立 C4 容器"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "执行与完成边界",
+      "items": [
+        "Host API 返回不等于 GPU 或网络工作已经完成",
+        "Proxy 推进网络请求；GDR 数据不需要经 CPU buffer 搬运"
+      ]
+    }
+  ]
+}
