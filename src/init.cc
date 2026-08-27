@@ -1225,8 +1225,18 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
 
   // Topo detection / System graph creation
+  /*
+  ncclTopoGetSystem
+    ↓
+  发现 GPU、NIC、PCI、CPU、NVLink 等物理关系
+  */
   NCCLCHECKGOTO(ncclTopoGetSystem(comm, &comm->topo), ret, fail);
   // Compute paths between GPUs and NICs
+  /*
+  ncclTopoComputePaths
+    ↓
+  计算 GPU↔GPU、GPU↔NIC 等可达路径和路径属性
+  */
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
   // Remove inaccessible GPUs and unused NICs
   NCCLCHECKGOTO(ncclTopoTrimSystem(comm->topo, comm), ret, fail);
@@ -1254,6 +1264,20 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
 
   NCCLCHECK(ncclNvlsInit(comm));
+
+/*
+ncclTopoCompute(Ring graph)
+ncclTopoCompute(Tree graph)
+ncclTopoCompute(CollNet graph)
+ncclTopoCompute(NVLS graph)
+    ↓
+为不同算法搜索可用的通信图
+
+结果保存进
+comm->topo
+comm->graphs[algorithm]
+
+*/
 
   timers[TIMER_INIT_GRAPHS] = clockNano();
   // Get rings and trees

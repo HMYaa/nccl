@@ -498,7 +498,7 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
         agg.trafficBytes += aggEnd->trafficBytes;
         aggEnd = aggEnd->next;
       }
-
+      // 定算法
       NCCLCHECK(ncclGetAlgoInfo(comm, &agg, collNetSupport, nvlsSupport, nTasksPerChannel, simInfo));
       agg.devFuncId = ncclDevFuncId(agg.func, agg.opDev.op, agg.datatype, agg.algorithm, agg.protocol);
 
@@ -2094,6 +2094,52 @@ ncclResult_t ncclGetRegBuff(struct ncclComm* comm, struct ncclTaskColl* info, in
 // Call the plugin first. Let it set algo+proto, and/or nChannels.
 // Then, topoGetAlgoInfo will set algo/proto if not set, then nChannels and nThreads based on algo/proto.
 // Finally, nChannels will be overriden by the plugin setting.
+/*
+架构上
+------------------
+输入当前任务和通信环境
+    ↓
+生成合法的 algorithm/protocol 候选
+    ↓
+预测各候选的时间或成本
+    ↓
+选择成本最低的候选
+    ↓
+返回 algorithm/protocol/channel/warp
+
+-------------------
+数学模型是
+合法候选集合 C
+= 当前环境支持的 (algorithm, protocol)
+
+best
+= argmin cost(candidate, input)
+
+-------------------
+主要输入
+1. 做什么
+   AllReduce、datatype、reduction op
+
+2. 数据多大
+   nBytes、count、pipeline operation 数量
+
+3. 在什么通信环境运行
+   communicator、nRanks、nNodes、topology/cost model
+
+4. 哪些能力可用
+   CollNet、NVLS、buffer registration
+
+5. 用户施加了什么限制
+   NCCL_ALGO、NCCL_PROTO、per-call algorithm selection、CTA policy
+----------------------
+主要输出
+algorithm
+protocol
+nWarps
+maxChannels
+estimated time
+
+*/
 ncclResult_t ncclGetAlgoInfo(struct ncclComm* comm, struct ncclTaskColl* info, int collNetSupport, int nvlsSupport,
                              int numPipeOps, ncclSimInfo_t* simInfo /* = NULL*/
 ) {
@@ -3244,18 +3290,33 @@ static ncclResult_t rawTaskAppend(struct ncclComm* comm, struct ncclInfo* info) 
 // Converts `info` to a task and adds it to `comm->planner`. The exception is with
 // single rank communicators, collectives are issued as `ncclMemcpyAsync`s and
 // thus don't need a task.
+// 负责识别请求种类并分流，不负责完整实现所有路径。(dispatcher)
+//taskAppend
+//│
+//├─ 不是 rearchitecture
+//├─ 不是 Send/Recv
+//├─ 不是 RMA
+//├─ 不是空操作
+//├─ 不是单 rank
+//├─ 不是 AllToAll/Gather/Scatter
+//├─ 当前学习不走 CE
+//│
+//└─ collTaskAppend(comm, info, opDev)
 static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
   ncclFunc_t collAPI = info->coll;
 
   if (ncclParamEnqueueRearchEnable()) {
     NCCLCHECK(rawTaskAppend(comm, info));
+    // 点对点,一对一送信，不是全员集合操作
   } else if (info->coll == ncclFuncSend || info->coll == ncclFuncRecv) {
     NCCLCHECK(p2pTaskAppend(comm, info, info->coll, collAPI, (void*)info->recvbuff, info->count, info->datatype,
                             info->root, true));
+  // 单边 RMA, 类似 RDMA write + 门铃，对端不用配对 Recv
   } else if (info->coll == ncclFuncPutSignal || info->coll == ncclFuncSignal || info->coll == ncclFuncWaitSignal) {
     NCCLCHECK(rmaTaskAppend(comm, info));
   } else {
     // Empty collectives can be discarded.
+    // 空 collective, 没有数据传输，直接返回
     if (info->count == 0) return ncclSuccess;
 
     // Validate any per-call algorithm selection up front, before the single-rank early-out and
@@ -3263,9 +3324,12 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
     // kernel selector, so without this an unsatisfiable selection (bad syntax, or a function with
     // no selectable algorithm) would be silently accepted despite forceAlgSelection. getAlgMask
     // rejects it when forceAlgSelection is set, else logs and falls back to automatic.
+    // 校验用户有没有强行指定算法；
+    // 算法选择，用户可以指定算法，也可以不指定，不指定则自动选择
     uint64_t algMask;
     NCCLCHECK(ncclCollConfigGetAlgMask(&info->collConfig, info->coll, &algMask));
 
+    // FP8 限制, sm90+ 支持
     if (info->datatype == ncclFloat8e4m3 || info->datatype == ncclFloat8e5m2) {
       if (comm->minCompCap < 90 && info->coll != ncclFuncAllGather && info->coll != ncclFuncBroadcast &&
           info->coll != ncclFuncAlltoAll && info->coll != ncclFuncScatter && info->coll != ncclFuncGather) {
@@ -3280,6 +3344,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
     NCCLCHECK(hostToDevRedOp(&opDev, info->op, info->datatype, comm));
 
     if (comm->nRanks == 1) {
+      //单 rank 类型的 task
       NCCLCHECK(ncclLaunchOneRank(info->recvbuff, info->sendbuff, info->count, opDev, info->datatype, info->stream));
       return ncclSuccess;
     } else {
@@ -3288,6 +3353,10 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       ncclDevrFindWindow(comm, info->sendbuff, &sendWin);
       ncclDevrFindWindow(comm, info->recvbuff, &recvWin);
       // Append CE collective task if CE is supported and requested by user
+      // 检查 CE 是否支持，CE 要的是 NVLink P2P，不是 GDR 的 RDMA
+      //CE（机内 AllGather）:
+      //  GPU A Copy Engine  --NVLink-->  GPU B 显存
+      //  cudaMemcpyAsync D2D 内存传输
       ncclSymRegType_t winRegType;
       NCCLCHECK(ncclGetSymRegType(sendWin, recvWin, &winRegType));
       bool ceAvailable = ncclCeAvailable(comm, info->coll, info->op, info->datatype, winRegType, sendWin, recvWin);
@@ -3318,6 +3387,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
         // For cuda graph checking
         NCCLCHECK(ncclCudaGetCapturingGraph(&graph, info->stream, comm->config.graphUsageMode));
         captured = ncclCudaGraphValid(graph);
+        // AllToAll
         if (info->coll == ncclFuncAlltoAll) {
           bool sendLocalValid = false;
           bool recvLocalValid = false;
@@ -3338,6 +3408,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
                                     (void*)((char*)info->recvbuff + r * info->count * ncclTypeSize(info->datatype)),
                                     info->count, info->datatype, r, allowUB));
           }
+        // Gather
         } else if (info->coll == ncclFuncGather) {
           size_t offset = 0;
           allowUB = captured;
@@ -3351,6 +3422,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
               offset += info->count * ncclTypeSize(info->datatype);
             }
           }
+        // Scatter
         } else if (info->coll == ncclFuncScatter) {
           size_t offset = 0;
           allowUB = captured;
@@ -3371,6 +3443,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
           // route when the user passed an algorithm selection so the selection is honored.
           NCCLCHECK(ceCollTaskAppend(comm, info, sendWin, recvWin, opDev));
         } else {
+        // 普通集合操作 传统方式 内核计算
           NCCLCHECK(collTaskAppend(comm, info, opDev));
         }
       }
