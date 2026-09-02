@@ -467,12 +467,12 @@ ncclResult_t bcastGrowHandle(struct ncclBootstrapHandle* handle, struct ncclComm
 
   // Single rank parent already has the handle, no need to broadcast
   if (parent->nRanks == 1) return ncclSuccess;
-  if (isRoot) {
+  if (isRoot) { // true  = handle 的发送者/协调者
     NCCLCHECK(bootstrapSend(parent->bootstrap, 0, BOOTSTRAP_TAG_GROW_BOUNDARY, handle,
                             sizeof(struct ncclBootstrapHandle)));
     NCCLCHECK(bootstrapSend(parent->bootstrap, parent->nRanks - 1, BOOTSTRAP_TAG_GROW_BOUNDARY, handle,
                             sizeof(struct ncclBootstrapHandle)));
-  } else {
+  } else { // false = handle 的接收者/边界 rank
     NCCLCHECK(bootstrapRecv(parent->bootstrap, -1, BOOTSTRAP_TAG_GROW_BOUNDARY, handle,
                             sizeof(struct ncclBootstrapHandle)));
   }
@@ -686,6 +686,8 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm, s
 
   uint64_t timers[BOOTSTRAP_INIT_TIME_N] = {0};
 
+  // bootstrapState 是 communicator 的 rank 会合/元数据交换控制面，不是 GPU/NET
+  // collective payload 的数据面推进对象。
   NCCLCHECK(ncclCalloc(&state, 1));
   state->rank = rank;
   state->nranks = nranks;
@@ -696,6 +698,8 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm, s
 
   // Set magic: for grow existing ranks, receive from coordinator; otherwise use handle magic.
   // This is consistent with the magic created in ncclCommGetUniqueId.
+  // magic 把本 rank 绑定到同一个 bootstrap 会话，作用类似控制面 session identity；
+  // 它不能证明后续 collective 选择了哪种 algorithm、transport 或 NIC path。
   if (handles != NULL) {
     // state and comm magic set to the first magic ID
     comm->magic = state->magic = BOOTSTRAP_HANDLE(handles, 0)->magic;
@@ -715,6 +719,7 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm, s
   // get the ring connection info
   memset(&nextPeer, 0, sizeof(union ringConnectInfo));
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_TIME_CREATE]);
+  // 为后续 rank 间初始化元数据交换发布可连接端点；这里建立的是 bootstrap 控制通道。
   if (ncclParamBootstrapNetEnable()) {
     // Create net interface for other ranks to contact me (all gather)
     NCCLCHECK(netGetDevice(rank, comm, &STATE_LISTEN(state, net.dev)));

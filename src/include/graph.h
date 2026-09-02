@@ -115,7 +115,20 @@ ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, int index
                               int locals[NCCL_TOPO_MAX_NODES], int* localCount, int* pathType);
 ncclResult_t ncclTopoGetDevNodes(struct ncclTopoSystem* system, int64_t baseId, struct ncclTopoNode** nodes,
                                  int* nNodes);
-
+/*
+  PATH_LOC  本地自身
+  PATH_NVL  直接 NVLink/NVSwitch
+  PATH_NVB  经过中间 GPU 的 NVLink
+  PATH_C2C  C2C
+  PATH_PIX  至多经过一个 PCI switch
+  PATH_PXB  经过多个 PCI switch
+  PATH_P2C  GPU 经 C2C 到 CPU，再经 PCIe 到 NIC
+  PATH_PXN  经中间 GPU 到 NIC
+  PATH_PHB  经过 PCI Host Bridge/CPU
+  PATH_SYS  跨 NUMA
+  PATH_NET  跨网络
+  PATH_DIS  不可达
+*/
 // Local (myself)
 #define PATH_LOC 0
 

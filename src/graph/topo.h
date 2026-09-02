@@ -52,7 +52,14 @@
 #define DEV 8
 #define CXB 9 // C2C Cross-Bridge: shared C2C bus node for GPUs split with mlopart
 extern const char* topoNodeTypeStr[];
-
+/*
+  LINK_LOC   GPU 与自己的 DEV
+  LINK_NVL   NVLink
+  LINK_C2C   GPU/DEV 到 CPU 的 C2C
+  LINK_PCI   PCIe
+  LINK_SYS   NUMA/CPU 间互联
+  LINK_NET   NIC 到 Network Plugin endpoint
+*/
 // We want link types and path types to match as much as possible
 #define LINK_LOC 0
 #define LINK_NVL 1
@@ -68,8 +75,9 @@ extern const char* topoNodeTypeStr[];
 extern const char* topoLinkTypeStr[];
 
 extern int64_t ncclParamPxnC2c();
-
+// 节点
 struct ncclTopoNode;
+// 边
 struct ncclTopoLink {
   int type;
   float bw;
@@ -81,24 +89,32 @@ struct ncclTopoLink {
 
 struct ncclTopoLinkList {
   struct ncclTopoLink** list;
-  int count;     // Number of links stored in list.
+  int count;     // Number of links stored in list. 几段路=> 几跳
   int capacity;  // Number of entries allocated for list.
-  float bw;
-  int type;
+  float bw; // 全程最窄那段限速（瓶颈带宽）
+  int type; // 路线等级（NVLink 直连 / 过 PCIe / 过 CPU / PXN…）
 };
 
 #define NCCL_TOPO_UNDEF (-1)
 
 #define NCCL_TOPO_ID_LOCAL_ID_MASK 0x00ffffffffffffff
-#define NCCL_TOPO_ID_SYSTEM_ID(id) (id >> 56)
-#define NCCL_TOPO_ID_LOCAL_ID(id) (id & NCCL_TOPO_ID_LOCAL_ID_MASK)
+#define NCCL_TOPO_ID_SYSTEM_ID(id) (id >> 56) // → 高 8 bit，多机时区分节点
+#define NCCL_TOPO_ID_LOCAL_ID(id) (id & NCCL_TOPO_ID_LOCAL_ID_MASK) // → 低 56 bit，本机 busId / dev 号
 #define NCCL_TOPO_LOCAL_NIC_ID(numaid, busid) (((int64_t)numaid << 56) + busid)
+/*
+    63                    56 55                              0
+    ├──── systemId (8b) ────┼──────── localId (56b) ──────────┤
+*/
 #define NCCL_TOPO_ID(systemid, localid) (((int64_t)systemid << 56) + (localid & NCCL_TOPO_ID_LOCAL_ID_MASK))
 #define NCCL_TOPO_GPU_LOCAL_RANK_SHIFT 40
 #define NCCL_TOPO_GPU_LOCAL_ID(busId, localRankOnDev) \
   ((((uint64_t)(localRankOnDev)) << 40) | ((busId) & ((((uint64_t)1) << 40) - 1)))
 #define NCCL_TOPO_MLOPART_MASK (0x3) // lower 2 bits: bit[0]=enabled, bit[1]=partition index
 #define NCCL_TOPO_MLOPART_DEV_MAX (2) // max DEV nodes per physical GPU (one per uGPU partition)
+/*
+    MLOPart busId 低位编码：
+      bit[1:0] = {partition_index, enabled_flag}
+*/
 #define NCCL_TOPO_MLOPART(mloPart) ((((int64_t)(mloPart) << 1) | 0x1) & NCCL_TOPO_MLOPART_MASK)
 #define NCCL_TOPO_MLOPART_BUSID(busId, mloPart) \
   ((mloPart) != NCCL_TOPO_UNDEF ? ((busId) | NCCL_TOPO_MLOPART(mloPart)) : (busId))
@@ -149,8 +165,18 @@ struct ncclTopoNode {
     } pci;
   };
   int nlinks;
-  struct ncclTopoLink links[NCCL_TOPO_MAX_LINKS];
+  struct ncclTopoLink links[NCCL_TOPO_MAX_LINKS];  // 邻接表，表示边
   // Pre-computed paths to GPUs and NICs
+  // 按目标类型分组的寻址表」——paths[t][j] = 从本节点到 nodes[t].nodes[j] 的预计算最优路径（hop 链 + 瓶颈带宽 + PATH 等级）。不是物理边，是算法用的路由缓存。
+  // paths[NET][2] │ 从我家到「第 3 个 NET 站点」的路线
+  /*  稀疏分配
+      paths[NET][n].list  = [link₀*, link₁*, link₂*]
+                                │         │         │
+                                ▼         ▼         ▼
+                              真实存在于某个 node->links[] 里的 ncclTopoLink
+                              link->remNode 指向下一个节点
+  */
+
   struct ncclTopoLinkList* paths[NCCL_TOPO_NODE_TYPES];
   // Used during search
   uint64_t used;
@@ -165,7 +191,7 @@ struct ncclTopoSystem {
   int systemId;
   uint64_t hostHashes[NCCL_TOPO_MAX_NODES];
   int nHosts;
-  struct ncclTopoNodeSet nodes[NCCL_TOPO_NODE_TYPES];
+  struct ncclTopoNodeSet nodes[NCCL_TOPO_NODE_TYPES]; // 按类型桶划分
   float maxBw;
   float totalBw;
   int inter;

@@ -231,7 +231,7 @@ void NCCL_NO_OPTIMIZE commPoison(ncclComm_t comm) {
 }
 
 #undef NCCL_NO_OPTIMIZE
-
+//  释放 普通 host heap， 来源`malloc` / `ncclCalloc`
 static ncclResult_t ncclDestructorFnFree(struct ncclDestructor* dtor) {
   free(dtor->obj);
   return ncclSuccess;
@@ -244,7 +244,7 @@ void ncclCommPushFree(struct ncclComm* comm, void* obj) {
   dtor->next = comm->destructorHead;
   comm->destructorHead = dtor;
 }
-
+// 释放CUDA device， 来源`cudaMalloc` / NCCL memManager 管的 device 缓冲
 static ncclResult_t ncclDestructorFnCudaFree(struct ncclDestructor* dtor) {
   NCCLCHECK(ncclCudaFree(dtor->obj, dtor->comm->memManager));
   return ncclSuccess;
@@ -254,10 +254,10 @@ void ncclCommPushCudaFree(struct ncclComm* comm, void* obj) {
   dtor->fn = ncclDestructorFnCudaFree;
   dtor->obj = obj;
   dtor->comm = comm;
-  dtor->next = comm->destructorHead;
+  dtor->next = comm->destructorHead;  // 头插
   comm->destructorHead = dtor;
 }
-
+// 释放 CUDA pinned host  来源`cudaHostAlloc` / `cudaMallocHost`
 static ncclResult_t ncclDestructorFnCudaHostFree(struct ncclDestructor* dtor) {
   NCCLCHECK(ncclCudaHostFree(dtor->obj));
   return ncclSuccess;
@@ -270,7 +270,7 @@ void ncclCommPushCudaHostFree(struct ncclComm* comm, void* obj) {
   dtor->next = comm->destructorHead;
   comm->destructorHead = dtor;
 }
-
+// 释放GDRCopy 映射的那类缓冲  来源：`ncclGdrCuda*` 路径
 static ncclResult_t ncclDestructorFnCudaGdrFree(struct ncclDestructor* dtor) {
   NCCLCHECK(ncclGdrCudaFree(dtor->obj, dtor->comm->memManager));
   return ncclSuccess;
@@ -444,6 +444,8 @@ static ncclResult_t dmaBufSupported(struct ncclComm* comm) {
 
 ncclResult_t ncclCommEnsureReady(ncclComm_t comm) {
   /* comm must be ready, or error will be reported */
+  // comm 指针已经分配不代表初始化已经完成。nonblocking 初始化期间，调用方可能已经拿到
+  // comm，但 initState 仍为 ncclInProgress；此时不能进入 enqueue/collective 主链。
   ncclResult_t ret = ncclSuccess;
   if (COMPILER_ATOMIC_LOAD(comm->abortFlag, std::memory_order_acquire)) {
     ncclGroupJobAbort(comm->groupJob);
@@ -471,6 +473,8 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
     return ncclInvalidArgument;
   }
 
+  // 初始化 communicator 生命周期内复用的基础状态。这里不是创建一次 collective task，
+  // 而是在填充后续多次 collective 共同依赖的 rank-local context。
   ncclMemoryStackConstruct(&comm->memPermanent);
   ncclMemoryStackConstruct(&comm->memScoped);
   comm->destructorHead = nullptr;
@@ -486,6 +490,8 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
     struct ncclSharedResources* sharedRes;
     NEW_NOTHROW(sharedRes, ncclSharedResources);
     /* most of attributes are assigned later in initTransportsRank(). */
+    // sharedRes 保存跨 collective 复用的 stream/event 等运行资源；其余依赖全局 rank
+    // 信息的共享属性，要等 initTransportsRank() 汇聚元数据后才能补齐。
     sharedRes->owner = comm;
     sharedRes->tpNRanks = comm->nRanks;
     NCCLCHECK(ncclCalloc(&sharedRes->tpRankToLocalRank, comm->nRanks));
@@ -1014,6 +1020,8 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
 
 static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* parent,
                                        uint64_t timers[TIMERS_INIT_COUNT]) {
+  // 这是 communicator 初始化的“大汇聚”阶段：先交换 peer 元数据，再建立 topology、
+  // algorithm graph、channel 和连接能力。它不处理某一次 AllReduce 的消息大小或最终算法选择。
   // We use 2 AllGathers
   // 1. { peerInfo, comm, compCap}
   // 2. { nChannels, graphInfo, topoRanks }
@@ -1085,7 +1093,15 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   uint64_t prevHostHash = 0;
 
   timers[TIMER_INIT_ALLGATHER] = clockNano();
+  /*
+   * ① AllGather1 — peer 名册
+      fillInfo(本 rank) → bootstrapAllGather(peerInfo)
+      → 版本/UUID 校验、nNodes 粗算、cuMem/CFT/MNNVL 等全局能力收敛
+
+   */
   // AllGather1 - begin
+  // 每个 rank 先填写自己的 peerInfo，再通过 bootstrapAllGather 获得全局成员视图。
+  // 这一步交换的是初始化元数据，不是 collective payload。
   NCCLCHECKGOTO(ncclCalloc(&comm->peerInfo, nranks + 1), ret, fail); // Extra rank to represent CollNet root
   NCCLCHECKGOTO(fillInfo(comm, comm->peerInfo + rank, comm->commHash), ret, fail);
   NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, comm->peerInfo, sizeof(struct ncclPeerInfo)), ret, fail);
@@ -1216,7 +1232,11 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   } while (0);
 
   timers[TIMER_INIT_TOPO] = clockNano();
-
+  /*
+   ② Topo — 物理拓扑
+      ncclTopoGetSystem → ComputePaths → Trim → SearchInit
+      → 绑 CPU affinity（后续 host 内存在本 GPU 近端）
+   */
   // Dump XML if requested by user
   const char* dumpXmlFile;
   dumpXmlFile = ncclGetEnv("NCCL_TOPO_DUMP_FILE");
@@ -1236,6 +1256,10 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   ncclTopoComputePaths
     ↓
   计算 GPU↔GPU、GPU↔NIC 等可达路径和路径属性
+
+  ③ Graphs — 算法图搜索（本地）
+     ncclTopoCompute: Ring / Tree / CollNet / NVLS …
+     → 得到本 rank 视角的 pattern、nChannels、带宽估计等
   */
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
   // Remove inaccessible GPUs and unused NICs
@@ -1493,7 +1517,15 @@ comm->graphs[algorithm]
       INFO(NCCL_GRAPH, "CPUs with mixed vendors were detected.");
     }
   }
-
+    /*
+    *
+    * ④ AllGather3 — 图与节点信息对齐
+        打包 graphInfo + topoRanks + 本地 NIC/CollNet 计数 …
+        → bootstrapAllGather
+        → 定 nNodes / localRanks / nodeRanks
+        → ncclTopoPostset 合成全局 rings/trees
+        → CollNet 是否真开得起来等
+    */
   // Now that we know nNodes, alloc nodeRanks and compute localRanks for each node
   NCCLCHECKGOTO(ncclCalloc(&comm->nodeRanks, comm->nNodes), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&comm->rankToLocalRank, comm->nRanks), ret, fail);
@@ -1633,6 +1665,12 @@ comm->graphs[algorithm]
   }
   comm->topParentLocalRanks = topParentLocalRanks;
 
+  /*
+   * ⑤ 共享服务就绪
+      computeBuffSizes、P2P channel 数
+      → ncclProxyCreate（之后才能走 proxy 路径）
+      → profiler 等
+   */
   // Profiler plugin context has to be initialized before proxy thread
   NCCLCHECK(ncclProfilerPluginInit(comm));
 
@@ -1668,7 +1706,14 @@ comm->graphs[algorithm]
   } else {
     comm->planner.rmaTaskQueues = NULL;
   }
-
+/*
+ * ⑥ Connect — 铺数据面连接
+    setupChannel + Ring/Tree/PAT/NVLS/CollNet connect
+    → 本机/PXN proxy SharedInit
+    → 可选 NVB/P2P preconnect
+    → tuning 子系统
+ *
+ */
   comm->runtimeConn = comm->cuMemSupport && ncclParamRuntimeConnect();
   if (comm->runtimeConn) {
     for (int c = 0; c < comm->nChannels; c++) {
@@ -1806,7 +1851,13 @@ comm->graphs[algorithm]
   comm->ceColl.baseUCSymReadyPtr = NULL;
   comm->ceColl.baseUCSymComplPtr = NULL;
   comm->ceColl.initialized = false;
-
+  /*
+   * ⑦ Device 侧收口
+      devCommSetup（host→device 拷 comm/channel 结构）
+      → barrier，避免有人已开打、有人还在 alloc（防死锁）
+      → 恢复 CPU affinity
+   *
+   */
   // Call devCommSetup before the last barrier, making sure we don't have a thread running in front and starting to
   // launch NCCL kernels before all cuda mem allocation is complete. That could cause a deadlock.
   NCCLCHECKGOTO(devCommSetup(comm), ret, fail);
@@ -1975,7 +2026,7 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   double sum_timers = 0;
   uint64_t timers[TIMERS_INIT_COUNT] = {0};
   unsigned long long commIdHash;
-
+  // ① 本卡 CUDA 准备       cudaSetDevice → 查 arch/sharedMem → ncclInitKernelsForDevice
   timers[TIMER_INIT_TOTAL] = clockNano();
   CUDACHECKGOTO(cudaSetDevice(cudaDev), res, fail);
   CUDACHECKGOTO(cudaDeviceGetAttribute(&maxSharedMem, cudaDevAttrMaxSharedMemoryPerBlockOptin, cudaDev), res, fail);
@@ -1992,7 +2043,23 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     CUDACHECKIGNORE(cudaDeviceSetLimit(cudaLimitStackSize, maxLocalSizeBytes));
   }
   timers[TIMER_INIT_KERNELS] = clockNano() - timers[TIMER_INIT_KERNELS];
+/*
+ * ② 分支：怎么建控制面会合
+    ┌─ parent && !isGrow  → Split/Shrink
+    │    算子群成员(color/key 或 exclude)
+    │    color==NOCOLOR → 只参与 allgather，不建新 comm，直接 exit
+    │    commAlloc(comm, parent, ...)
+    │    bootstrapSplit(...)
+    │
+    └─ else               → 普通 Init 或 Grow
+         算 commHash（uniqueId 或 grow magic）
+         commAlloc(comm, NULL, ...)   // Grow 也可带 parent，但走 bootstrapInit
+         bootstrapInit(...)
 
+         ┌── Split(color,key)  → 按 color 分桶，同 color 建子 comm
+现有 comm ────┼── Shrink(exclude…) → 剔除 excludeRanks，建更小的新 comm
+         └── Grow(nRanks,id)  → 扩到更大 nRanks（常要先 GetUniqueId）
+ */
   if (job->parent && !job->isGrow) {
     // SPLIT/SHRINK: use bootstrapSplit
     NCCLCHECKGOTO(ncclCalloc(&parentRanks, job->parent->nRanks), res, fail);
@@ -2038,6 +2105,8 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
       // obtain a unique hash using the first commId
       comm->commHash = commIdHash = getHash(job->commId->internal, NCCL_UNIQUE_ID_BYTES);
     }
+    // 普通 ncclCommInitRank 主线：先建立 rank-local 的持久 comm 状态，再通过
+    // bootstrap 建立 rank 间控制面会合能力。两步都不传输 collective payload。
     timers[TIMER_INIT_ALLOC] = clockNano();
     NCCLCHECKGOTO(commAlloc(comm, NULL, job->nranks, job->myrank), res, fail);
     timers[TIMER_INIT_ALLOC] = clockNano() - timers[TIMER_INIT_ALLOC];
@@ -2052,9 +2121,23 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   }
   comm->cudaArch = cudaArch;
 
+  /*
+   * ③ 数据面骨架
+      initTransportsRank(comm, parent, timers)
+      → peer 信息 / topo / graph / channel / 连接规划
+   */
+  // 从这里开始把各 rank 的 peer 能力、物理 topology、algorithm graph 和 channel
+  // 汇聚进 comm，供后续多次 collective 的 tuning/launch 复用。
   NCCLCHECKGOTO(initTransportsRank(comm, job->parent, timers), res, fail);
 
+  /*
+   * ④ 收口
+      initState = Success（fail 路径写错误码）
+      打 TRACE/INFO/耗时 profile
+      若 job->newcomm：原子发布给用户指针
+   *  */
   // update communicator state
+  // 只有前面的 rank 会合和 communicator 级资源初始化全部成功后，comm 才跨过 ready 门槛。
   comm->initState = ncclSuccess;
   timers[TIMER_INIT_TOTAL] = clockNano() - timers[TIMER_INIT_TOTAL];
 
@@ -2716,6 +2799,8 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
     goto fail;
   }
 
+  // 分配 comm 外壳
+  // ncclCommInitRankFunc() 中的 commAlloc()/initTransportsRank() 填充。
   NCCLCHECKGOTO(ncclCalloc(&comm, 1), res, fail);
   NCCLCHECKGOTO(ncclCalloc(&comm->abortFlag, 1), res, fail);
   NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->abortFlagDev, 1), res, fail);
@@ -2725,11 +2810,14 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
   for (int i = 0; i < ncclGroupTaskTypeNum; i++) {
     comm->groupNext[i] = reinterpret_cast<struct ncclComm*>(NCCL_COMM_GROUP_INVALID);
   }
-  NCCLCHECKGOTO(parseCommConfig(comm, config), res, fail);
+  NCCLCHECKGOTO(parseCommConfig(comm, config), res, fail);  //  parseCommConfig填充
   /* start with ncclInProgress and will be changed to ncclSuccess if init succeeds. */
+  // 指针发布与对象 ready 是两个事件。blocking 路径会在外层 group 收口时等待；
+  // nonblocking 路径则可能让调用方先拿到 comm，再通过 async error 接口观察完成状态。
   comm->initState = ncclInProgress;
   *newcomm = comm;
 
+  //  提交 async job
   NEW_NOTHROW_GOTO(job, ncclCommInitRankAsyncJob, res, fail);
   job->nId = nId;
   job->comm = comm;
@@ -2743,6 +2831,7 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
   // Therefore the array of Ids coming from the user might not be properly aligned to be cast into a
   // ncclBootstrapHandle
   // copying into allocated memory guarantees that the memory is properly aligned for any objects, removing that issue
+  // 同时复制 commId 也把它的生命周期转移给 job，避免异步执行继续依赖调用者的原始内存。
   NCCLCHECKGOTO(ncclCalloc(&job->commId, nId), res, fail);
   memcpy(job->commId, commId, nId * NCCL_UNIQUE_ID_BYTES);
 
@@ -2757,6 +2846,8 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
     NCCLCHECKGOTO(bootstrapCreateRoot((struct ncclBootstrapHandle*)&job->commId[0], true), res, fail);
   }
   launchedJob = true;
+  // 真正的 commAlloc/bootstrap/topology 初始化在 ncclCommInitRankFunc() 中执行；
+  // 当前函数只完成参数校验、外壳发布和初始化 job 提交。
   if (ncclParamEnqueueRearchEnable()) {
     NCCLCHECKGOTO(ncclMgmtTaskEnqueue((struct ncclAsyncJob*)job, ncclCommInitRankFunc, ncclCommInitJobFree, comm), res,
                   fail);
@@ -2778,7 +2869,7 @@ fail:
   if (newcomm) *newcomm = NULL;
   goto exit;
 }
-
+// **为本 rank 初始化一个 communicato**  — 分布式：每个进程带上自己的 myrank 加入
 NCCL_API(ncclResult_t, ncclCommInitRank, ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank);
 ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank) {
   ncclResult_t ret = ncclSuccess;
@@ -2791,6 +2882,8 @@ ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId comm
   ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
   CUDACHECK(cudaGetDevice(&cudaDev));
 
+  // communicator 初始化也复用 internal group 的提交/收口机制。不要把这里的
+  // group 边界误解为 collective 已执行；它只负责收口初始化 job。
   NCCLCHECK(ncclGroupStartInternal());
 
   NCCLCHECKGOTO(ncclCommInitRankDev(newcomm, nranks, 1, &commId, myrank, cudaDev, &config, __func__), ret, fail);
@@ -2805,7 +2898,7 @@ exit:
 fail:
   goto exit;
 }
-
+// ncclCommInitAll      — 单机：本进程替多个 GPU 一次性全建
 NCCL_API(ncclResult_t, ncclCommInitAll, ncclComm_t* comms, int ndev, const int* devlist);
 ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int* devlist) {
   ncclResult_t ret = ncclSuccess;
