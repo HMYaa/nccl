@@ -1,0 +1,33 @@
+```mermaid
+flowchart LR
+  subgraph API["API / Rank 进程"]
+    A["comm 外壳<br/>InProgress"]
+    E["comm ready<br/>Success"]
+    F["AllReduce<br/>选用模板"]
+  end
+
+  subgraph CTRL["控制面"]
+    B["bootstrap<br/>默认 TCP socket"]
+  end
+
+  subgraph BUILD["initTransportsRank"]
+    C["①②③ 名册·地图·队形<br/>Ring/Tree 模板"]
+    D["④ 把路铺好<br/>P2P / SHM / IB + proxy"]
+  end
+
+  A -->|会合| B
+  B -->|元数据 AllGather| C
+  C -->|按队形建连接| D
+  D -->|铺路完成| E
+  E -.->|运行时选用| F
+
+  classDef control fill:#e0f2fe,stroke:#0284c7
+  classDef data fill:#dcfce7,stroke:#16a34a
+  class B control
+  class D data
+```
+
+说明：
+- 控制面默认 TCP socket，只换初始化元数据
+- 数据面才是同机 P2P/NVLink/SHM、跨机 IB（常经 proxy）
+- Init 备好队形模板；某次 collective 再选用

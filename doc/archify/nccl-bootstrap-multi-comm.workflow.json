@@ -1,0 +1,340 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "NCCL Bootstrap：Parent 如何建立两个 Child Communicator",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "animation": "none",
+    "views": [
+      {
+        "id": "overview",
+        "label": "全局",
+        "focus": [
+          "parent_rendezvous",
+          "parent_ready",
+          "split_membership",
+          "parent_relay",
+          "child_a_shell",
+          "child_a_endpoint",
+          "child_a_ring",
+          "child_a_ready",
+          "child_b_shell",
+          "child_b_endpoint",
+          "child_b_ring",
+          "child_b_ready"
+        ],
+        "note": "从 Parent 会合开始，观察两个 color 组如何各自形成独立 Child communicator。"
+      },
+      {
+        "id": "parent_build",
+        "label": "Parent 建链",
+        "focus": ["parent_rendezvous", "parent_ready"],
+        "note": "Root 只收集 endpoint 并返回 nextPeer；每个 rank 随后建立自己的 Parent bootstrapState。"
+      },
+      {
+        "id": "split_relay",
+        "label": "Split 借道",
+        "focus": [
+          "split_membership",
+          "child_a_shell",
+          "child_a_endpoint",
+          "child_b_shell",
+          "child_b_endpoint",
+          "parent_relay",
+          "child_a_ring",
+          "child_b_ring"
+        ],
+        "note": "先用 Parent AllGather 算成员表，再借 Parent P2P socket 交换 Child endpoint。"
+      },
+      {
+        "id": "state_ownership",
+        "label": "状态与所有权",
+        "focus": [
+          "parent_ready",
+          "child_a_shell",
+          "child_a_ring",
+          "child_a_ready",
+          "child_b_shell",
+          "child_b_ring",
+          "child_b_ready"
+        ],
+        "note": "三个 comm 各自拥有 bootstrapState；splitShare 只改变部分资源复用，不合并 bootstrap ring。"
+      }
+    ],
+    "output": "doc/archify/nccl-bootstrap-multi-comm.html",
+    "viewBox": [1200, 590]
+  },
+  "lanes": [
+    { "id": "parent", "label": "Parent control plane" },
+    { "id": "child_a", "label": "Child A · color=0 · {P0,P2}" },
+    { "id": "child_b", "label": "Child B · color=1 · {P1,P3}" }
+  ],
+  "phases": [
+    { "id": "rendezvous", "label": "Parent 会合", "fromCol": 0, "toCol": 0 },
+    { "id": "parent_ready_phase", "label": "Parent Ready", "fromCol": 1, "toCol": 1 },
+    { "id": "membership", "label": "成员计算", "fromCol": 2, "toCol": 2, "variant": "emphasis" },
+    { "id": "relay", "label": "Endpoint 交换", "fromCol": 3, "toCol": 3, "variant": "emphasis" },
+    { "id": "child_ring", "label": "Child 建环", "fromCol": 4, "toCol": 4, "variant": "emphasis" },
+    { "id": "publish", "label": "独立 Ready", "fromCol": 5, "toCol": 5, "variant": "dashed" }
+  ],
+  "mainPath": [
+    "parent_rendezvous",
+    "parent_ready",
+    "split_membership",
+    "child_a_shell",
+    "child_a_endpoint",
+    "parent_relay",
+    "child_a_ring",
+    "child_a_ready"
+  ],
+  "nodes": [
+    {
+      "id": "parent_rendezvous",
+      "lane": "parent",
+      "col": 0,
+      "type": "external",
+      "label": "Parent 会合",
+      "sublabel": "上报 extInfo",
+      "tag": "root 返回 nextPeer"
+    },
+    {
+      "id": "parent_ready",
+      "lane": "parent",
+      "col": 1,
+      "type": "backend",
+      "label": "P ready",
+      "sublabel": "ring + peers",
+      "tag": "Success",
+      "width": 72
+    },
+    {
+      "id": "split_membership",
+      "lane": "parent",
+      "col": 2,
+      "type": "database",
+      "label": "成员分组",
+      "sublabel": "color/key",
+      "tag": "parentRanks",
+      "width": 72
+    },
+    {
+      "id": "parent_relay",
+      "lane": "parent",
+      "col": 3,
+      "type": "messagebus",
+      "label": "Parent relay",
+      "sublabel": "COMMSPLIT tag",
+      "tag": "ringConnectInfo"
+    },
+    {
+      "id": "child_a_shell",
+      "lane": "child_a",
+      "col": 2,
+      "type": "frontend",
+      "label": "A 外壳",
+      "sublabel": "*newcomm=NULL",
+      "tag": "InternalError sentinel"
+    },
+    {
+      "id": "child_a_endpoint",
+      "lane": "child_a",
+      "col": 3,
+      "type": "messagebus",
+      "label": "A 端点",
+      "width": 60
+    },
+    {
+      "id": "child_a_ring",
+      "lane": "child_a",
+      "col": 4,
+      "type": "cloud",
+      "label": "A 控制环",
+      "width": 60
+    },
+    {
+      "id": "child_a_ready",
+      "lane": "child_a",
+      "col": 5,
+      "type": "backend",
+      "label": "A comm ready",
+      "sublabel": "发布 newcomm",
+      "tag": "transports · Success"
+    },
+    {
+      "id": "child_b_shell",
+      "lane": "child_b",
+      "col": 2,
+      "type": "frontend",
+      "label": "B 外壳",
+      "sublabel": "*newcomm=NULL",
+      "tag": "InternalError sentinel"
+    },
+    {
+      "id": "child_b_endpoint",
+      "lane": "child_b",
+      "col": 3,
+      "type": "messagebus",
+      "label": "B 端点",
+      "width": 60
+    },
+    {
+      "id": "child_b_ring",
+      "lane": "child_b",
+      "col": 4,
+      "type": "cloud",
+      "label": "B 控制环",
+      "width": 60
+    },
+    {
+      "id": "child_b_ready",
+      "lane": "child_b",
+      "col": 5,
+      "type": "backend",
+      "label": "B comm ready",
+      "sublabel": "发布 newcomm",
+      "tag": "transports · Success"
+    }
+  ],
+  "edges": [
+    {
+      "id": "parent_connect",
+      "from": "parent_rendezvous",
+      "to": "parent_ready",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "start_split",
+      "from": "parent_ready",
+      "to": "split_membership",
+      "variant": "default",
+      "role": "main",
+      "fromSide": "top",
+      "toSide": "top",
+      "route": "up-channel",
+      "channelY": 55
+    },
+    {
+      "id": "group_a",
+      "from": "split_membership",
+      "to": "child_a_shell",
+      "variant": "emphasis",
+      "role": "main",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight"
+    },
+    {
+      "id": "group_b",
+      "from": "split_membership",
+      "to": "child_b_shell",
+      "variant": "default",
+      "role": "branch",
+      "fromSide": "bottom",
+      "toSide": "left",
+      "route": "auto",
+      "via": [[300, 185], [150, 185], [150, 367]]
+    },
+    {
+      "id": "derive_a",
+      "from": "child_a_shell",
+      "to": "child_a_endpoint",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "derive_b",
+      "from": "child_b_shell",
+      "to": "child_b_endpoint",
+      "variant": "default",
+      "role": "branch"
+    },
+    {
+      "id": "announce_a",
+      "from": "child_a_endpoint",
+      "to": "parent_relay",
+      "variant": "emphasis",
+      "role": "main",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "route": "straight"
+    },
+    {
+      "id": "announce_b",
+      "from": "child_b_endpoint",
+      "to": "parent_relay",
+      "variant": "default",
+      "role": "branch",
+      "fromSide": "top",
+      "toSide": "right",
+      "route": "auto",
+      "via": [[430, 310], [820, 310], [820, 119]]
+    },
+    {
+      "id": "connect_a",
+      "from": "parent_relay",
+      "to": "child_a_ring",
+      "variant": "emphasis",
+      "role": "main",
+      "fromSide": "right",
+      "toSide": "bottom",
+      "route": "auto",
+      "via": [[700, 119], [700, 290], [500, 290]]
+    },
+    {
+      "id": "connect_b",
+      "from": "parent_relay",
+      "to": "child_b_ring",
+      "variant": "default",
+      "role": "branch",
+      "fromSide": "right",
+      "toSide": "top",
+      "route": "auto",
+      "via": [[740, 119], [740, 310], [500, 310]]
+    },
+    {
+      "id": "ready_a",
+      "from": "child_a_ring",
+      "to": "child_a_ready",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "ready_b",
+      "from": "child_b_ring",
+      "to": "child_b_ready",
+      "variant": "default",
+      "role": "branch"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "对象边界",
+      "items": [
+        "ncclComm* 只在本进程内存在，网络上从不传 comm 指针",
+        "Parent、Child A、Child B 各自拥有独立 bootstrapState",
+        "Parent bootstrap 只负责介绍 Child endpoint，不会被剪成 Child ring"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "状态与特殊路径",
+      "items": [
+        "普通 Parent：initState 从 InProgress 收口到 Success",
+        "成功 Split：Child 从未发布外壳走到 Success，再原子发布 newcomm",
+        "NCCL_SPLIT_NOCOLOR 只参与成员 AllGather；失败时 initState 记录错误"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "资源与数据面边界",
+      "items": [
+        "主线 splitShare=0：Child 各建地址表和 proxy 资源",
+        "splitShare=1 可复用 sharedRes、memManager、abortFlag，但 bootstrapState 仍独立",
+        "Bootstrap 是初始化控制面，不证明 collective algorithm、transport 或 GDR"
+      ]
+    }
+  ]
+}
