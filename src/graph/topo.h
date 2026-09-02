@@ -187,6 +187,16 @@ struct ncclTopoNodeSet {
   struct ncclTopoNode nodes[NCCL_TOPO_MAX_NODES];
 };
 
+/*
+  一张总图
+
+     1 │ncclTopoSystem
+     2 │└─ nodes[type]           ← 桶
+     3 │   └─ ncclTopoNode
+     4 │      ├─ links[]         ← Layer-0：物理出边邻接表
+     5 │      └─ paths[type][]   ← Layer-1：到某类每个节点的预计算最优路由
+     6 │           └─ { type, bw, count, list[] }
+*/
 struct ncclTopoSystem {
   int systemId;
   uint64_t hostHashes[NCCL_TOPO_MAX_NODES];
