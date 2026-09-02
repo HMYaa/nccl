@@ -28,7 +28,8 @@ extern struct ncclTransport p2pTransport;
 extern struct ncclTransport shmTransport;
 extern struct ncclTransport netTransport;
 extern struct ncclTransport collNetTransport;
-
+// ncclTransports[NTRANSPORTS] = { P2P, SHM, NET, COLLNET }   ← 数组下标即优先级
+// 每个: { name, canConnect, send:ncclTransportComm, recv:ncclTransportComm }
 extern struct ncclTransport* ncclTransports[];
 // Forward declarations
 struct ncclRing;
@@ -38,29 +39,49 @@ struct ncclComm;
 int64_t ncclParamMultiSegmentRegister();
 extern int64_t ncclParamNvlsEnable();
 
+// 每个 rank 的"能力名片"。init 时由 fillInfo() 填好，经 bootstrapAllGather 一次性全量交换
+// （见 init.cc），之后作为 transport->canConnect() 的输入向量，用于判定两个 rank 之间能走哪条链路。
+// 注意：整体按 sizeof(struct ncclPeerInfo) 交换，字段顺序即线上布局，不要随意重排。
 struct ncclPeerInfo {
+  // === 身份标识 ===
   int rank;
-  int cudaDev;
-  int nvmlDev;
-  int gdrSupport;
-  uint64_t hostHash;
-  uint64_t pidHash;
-  dev_t shmDev;
-  int64_t busId;
-  cudaUUID_t gpuUuid;
-  struct ncclComm* comm;
-  int cudaCompCap;
-  int gpuCftSupport;
-  size_t totalGlobalMem;
-  // MNNVL support
-  nvmlGpuFabricInfoV_t fabricInfo;
-  int fabricHandleSupport;
-  int cuMemSupport;
-  int version;
-  uint64_t supportedGinTypeBitMask;
-  bool crossNicSupport;
-  bool rmaPluginAvailable;
-  bool cuMemGdrSupport;
+  int cudaDev; // CUDA_VISIBLE_DEVICES 过滤后的序号
+  int nvmlDev; // NVML(NVIDIA Management Library,一套 GPU 管理/查询库) 序号，不受 CUDA_VISIBLE_DEVICES 影响；用于日志，以及判定多 rank 复用同一物理卡
+
+  // === 内存/DMA 能力（另见下方 cuMemGdrSupport）===
+  int gdrSupport; // GPUDirect RDMA：NIC 能否直接读写显存，决定 NET 传输是否绕开 host bounce buffer
+
+  // === 局部性判定：决定 P2P/SHM 是否可用 ===
+  uint64_t hostHash; // 主机指纹（含 commHash）。相等 => 同主机 => 可考虑 P2P/SHM
+  uint64_t pidHash;  // 进程指纹（含 commHash）。与 hostHash 同时相等 => 同进程（P2P_SAME_PID）
+                     // => 可直接用裸指针，无需 CUDA IPC
+  dev_t shmDev;      // /dev/shm 的 st_dev。容器间若不是同一个 shm 挂载点则 SHM 传输不可用
+
+  // === 拓扑定位 ===
+  int64_t busId;           // PCI busId，作为 topo 图中 GPU 节点的 key
+  cudaUUID_t gpuUuid;      // 用于检测多个 rank 是否绑定到同一 GPU/分区
+  struct ncclComm* comm;   // 同进程时可直接解引用对端 comm，用来串起 intraNext 进程内 comm 链表
+
+  // === GPU 属性 ===
+  int cudaCompCap;         // SM 架构版本
+  int gpuCftSupport;       // CFT 所需的 CUDA 版本，0 表示不支持；comm 级取所有 rank 的最小值
+  size_t totalGlobalMem;   // 显存容量（上取整到 4GB）；对称内存取全体最大值作为 VA 窗口 stride
+
+  // === MNNVL：跨节点 NVLink domain ===
+  nvmlGpuFabricInfoV_t fabricInfo; // clusterUuid/cliqueId/state；同 cluster 同 clique 才能走 MNNVL
+  int fabricHandleSupport;         // 能否导出 fabric handle（CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED）
+  int cuMemSupport;                // VMM/cuMem API 是否可用，决定 P2P 走 cuMem 还是 legacy CUDA IPC
+
+  // === 版本校验 ===
+  int version; // NCCL_VERSION_CODE，所有 rank 必须一致，否则 init 直接报错
+
+  // === 网络/对称内存能力（这几项 comm 级都取全体交集）===
+  uint64_t supportedGinTypeBitMask; // 本 rank 可用的 GIN backend 位掩码（GDAKI/PROXY...）
+  bool crossNicSupport;             // 是否允许跨 NIC 通信，影响 GIN 是 FULL 还是仅 RAIL 连接
+  bool rmaPluginAvailable;          // RMA plugin 是否已加载
+  bool cuMemGdrSupport;             // GDR 与 CUDA VMM 能否共存（GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED）
+
+  // === 分区 GPU ===
   int mloPart; // MLOPart partition index, or -1 if not an MLOPart GPU
 };
 
@@ -113,12 +134,39 @@ struct ncclCollNetSharedRes {
   int nChannels;
   size_t buffSize;
 };
+/*
 
+GPU 侧的数据面完全不碰 vtable，碰 vtable 的只有 CPU proxy
+  那一半。
+
+  精确版本
+
+     1 │              ┌── host 控制面：建链 ──────────────────────┐
+     2 │ vtable 覆盖  │   setup / connect / free                  │  函数指针调用
+     3 │              │   proxySetup / proxyConnect / proxyRegister│
+     4 │              ├── CPU 数据面：proxy progress 循环 ─────────┤
+     5 │              │   proxyProgress  ← 每轮循环通过指针调用    │
+     6 │              └───────────────────────────────────────────┘
+     7 │
+     8 │              ┌── GPU 数据面：kernel ─────────────────────┐
+     9 │ vtable 不覆盖│   只读 ncclConnInfo 里的裸指针            │  零间接跳转
+    10 │              │   buffs[] / head / tail / connFifo / flags │
+    11 │              └───────────────────────────────────────────┘
+
+*/
+//10 个指针：控制面被劈成两半
 struct ncclTransportComm {
+  // --- 调用者线程（ncclCommInitRank 路径）
+
+  // 本地分配 + 往 ncclConnect 里填自己的信息
   ncclResult_t (*setup)(struct ncclComm* comm, struct ncclTopoGraph* graph, struct ncclPeerInfo*, struct ncclPeerInfo*,
                         struct ncclConnect*, struct ncclConnector*, int channelId, int connIndex);
+  // 收到对端信封后完成 attach
   ncclResult_t (*connect)(struct ncclComm* comm, struct ncclConnect*, int nranks, int rank, struct ncclConnector*);
   ncclResult_t (*free)(struct ncclComm* comm, struct ncclConnector*);
+
+  // --- ncclProxyCallAsync（跨线程/跨进程 RPC）
+
   ncclResult_t (*proxySharedInit)(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState,
                                   int nChannels);
   ncclResult_t (*proxySetup)(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState, void* reqBuff,
@@ -126,7 +174,9 @@ struct ncclTransportComm {
   ncclResult_t (*proxyConnect)(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState, void* reqBuff,
                                int reqSize, void* respBuff, int respSize, int* done);
   ncclResult_t (*proxyFree)(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState);
+  // 数据面！轮询 CQ、推进 FIFO
   ncclResult_t (*proxyProgress)(struct ncclProxyState* proxyState, struct ncclProxyArgs*);
+  // MR 注册
   ncclResult_t (*proxyRegister)(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState,
                                 void* reqBuff, int reqSize, void* respBuff, int respSize, int* done);
   ncclResult_t (*proxyDeregister)(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState,

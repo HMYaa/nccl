@@ -133,11 +133,13 @@ static_assert(NCCL_LL_CLEAN_MASK % NCCL_STEPS == 0, "Invalid NCCL_LL_CLEAN_MASK 
 
 struct ncclConnInfo {
   // Regular comm mechanism
+  // GPU side: send/recv buffer, head/tail, step, flags
   char* buffs[NCCL_NUM_PROTOCOLS]; // Local for recv, remote for send
   void* mhandles[NCCL_NUM_PROTOCOLS];
   uint64_t* tail;     // Local for recv, remote for send
   uint64_t* head;     // Local for send, remote for recv
 
+  // host side
   int flags;          // Direct communication / other flags
   int shared;         // Buffers are shared
   int stepSize;       // Step size for the SIMPLE buffer
@@ -167,10 +169,10 @@ struct ncclConnector {
   int connected;
   int hasSeen;
   int p2pOnly;
-  struct ncclProxyConnector proxyConn;
-  struct ncclTransportComm* transportComm;
-  void* transportResources;
-  struct ncclConnInfo conn;
+  struct ncclProxyConnector proxyConn;     // 指向哪个 proxy 线程/进程服务这条连接
+  struct ncclTransportComm* transportComm; // vtable 指针，selectTransport 时绑定
+  void* transportResources;                // 每种 transport 自己的私有结构
+  struct ncclConnInfo conn;                // ★ 唯一会被拷进 devComm 给 GPU 看的部分
 };
 
 struct ncclRing {
