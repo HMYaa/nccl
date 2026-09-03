@@ -562,52 +562,75 @@ typedef enum ncclCheckMode {
   ncclCheckModeDebugGlobal = 2,
 } ncclCheckMode_t;
 
+// 通信域的中枢对象：一个 rank 的全部 host 侧状态。生命周期 = ncclCommInitRank .. ncclCommDestroy。
+// 阅读提示：字段大致按"init 阶段填充顺序"排列，下面按功能域分块标注。
+// 注意：布局对 devComm 拷贝、cache line padding（intraPad*）和首尾 magic 校验敏感，不要随意重排字段。
 struct ncclComm {
-  uint64_t startMagic;
+  // ============ 对象自检与内存生命周期 ============
+  uint64_t startMagic; // 与 endMagic 成对，CommCheck() 每次 API 入口校验，用于检测 comm 内存被踩/野指针
+  // memPermanent: comm 全生命周期 arena（channel、topo、各 memPool 的 backing），commFree 时整体析构
+  // memScoped:    ncclGroupStart/End 作用域内的临时 arena，GroupEnd 时 Pop 回滚 bump 指针
   struct ncclMemoryStack memPermanent, memScoped;
   // List of destructors to run when comm is destructed
+  // 头插的 LIFO 延迟清理链（ncclCommPushFree / PushCudaFree 等），commFree 时逆序执行
   struct ncclDestructor* destructorHead;
 
-  struct ncclCudaContext* context;
-  struct ncclSharedResources* sharedRes;
+  // ============ 资源共享与父子 comm（split / grow / shrink）============
+  struct ncclCudaContext* context;      // per-CUDA-context 的 launchOrder 状态，按 commHash 引用计数
+  struct ncclSharedResources* sharedRes; // 可跨 comm 复用：peers/devPeers、内部 stream、proxyState、ginState
   /* map to top parent ranks. */
+  // 本 comm 的 rank -> 最初创建 sharedRes 的那个 comm 的 rank；非共享时是恒等映射。
+  // 用它索引 sharedRes->peers[] 以及 proxy/net 侧的 tpRank
   int* topParentRanks;
   int* topParentLocalRanks;
-  struct ncclChannel channels[MAXCHANNELS];
-  struct ncclPeerInfo* peerInfo;
-  struct ncclTopoSystem* topo;
+
+  // ============ 拓扑、对端信息与本地网络能力 ============
+  struct ncclChannel channels[MAXCHANNELS]; // 每个 channel 一套 ring/tree/collnet/nvls 的 peer 连接
+  struct ncclPeerInfo* peerInfo;            // 长度 nRanks，AllGather1 换来的全体能力名片（见 transport.h）
+  struct ncclTopoSystem* topo;              // 本节点探测出的 PCIe/NVLink/NIC 拓扑图
+  // 长度 nRanks 的 P2P proxy connector 缓存（懒初始化），跨进程交换 cuMem handle / UDS fd
   struct ncclProxyConnector* gproxyConn;
+  // legacy IPC 注册的延迟清理队列，comm 销毁时同步 drain
   struct ncclIntruQueue<struct ncclCommCallback, &ncclCommCallback::next> legacyRegCleanupQueue;
   bool peerInfoValid;
   int minNetCount; // Minimum number of network devices local to a rank
   float minLocalNetBw; // Minimum total network bandwidth local to a GPU
   float minNetBw; // Minimum bw of any network device local to a rank
+  // 上面三个都是 AllGather3 后的全局 min，用来限制 registered buffer 能铺开的 channel 数
 
-  ncclNet_t* ncclNet;
+  // ============ 网络插件（NET / CollNet / RMA 的可插拔实现）============
+  ncclNet_t* ncclNet;    // 选中的网络插件 vtable：isend/irecv/regMr...（内置 IB 或外部 plugin）
   void* netContext;
   void* rmaContext;
   int netPluginIndex;
   int rmaPluginIndex;
   int ncclNetVer;
-  ncclNetDeviceType netDeviceType;
-  ncclCollNet_t* ncclCollNet;
+  ncclNetDeviceType netDeviceType; // 是否支持 device-initiated 网络（GIN/GDAKI）
+  ncclCollNet_t* ncclCollNet;      // in-network reduction（SHARP）插件
   void* collNetContext;
-  void* bootstrap;
+
+  // ============ 建连控制面 ============
+  void* bootstrap; // 带外 TCP 通道，负责 AllGather peerInfo 与交换 ncclConnect 信封
   bool isGrow; // true if this comm is created via ncclCommGrow
   // Bitmasks for ncclTransportP2pSetup
+  // connectSend[peer] / connectRecv[peer] 的 bit i 表示"与该 peer 的第 i 个 channel 待建连"；
+  // ncclTransportP2pSetup 消费后清零
   uint64_t* connectSend;
   uint64_t* connectRecv;
-  struct ncclTopoGraph graphs[NCCL_NUM_ALGORITHMS];
-  int maxTreePattern;
-  bool initAlgoChannels[NCCL_NUM_ALGORITHMS];
+  struct ncclTopoGraph graphs[NCCL_NUM_ALGORITHMS]; // 各算法的拓扑搜索结果（带宽/延迟/pattern）
+  int maxTreePattern;                               // 全局 max，tree tuning 时据此折减带宽估计
+  bool initAlgoChannels[NCCL_NUM_ALGORITHMS];       // runtimeConn 下各算法是否已完成懒建连
   bool runtimeConn; // if dynamic connection is supported
+                    // 开启后 init 只做 setupChannel，ring/tree 建连推迟到首次 collective
   bool directMode; // if any process manages more than one local rank
   int cuMemSupport;
 
+  // ============ 身份标识与本地硬件属性 ============
   uint64_t magic; // Magic number for all network communication. Not a security key -- only goal is to detect
                   // mismatches.
+                  // bootstrap/proxy socket 的握手码，防止不同 comm 的连接串线；split/grow 由父 magic 派生
 
-  uint64_t commHash;
+  uint64_t commHash; // comm 的全局标识（uniqueId 哈希），用于 NVTX/RAS/tuner，并混入 peerInfo 的 host/pidHash
   int rank;    // my rank in the communicator
   int nRanks;  // number of GPUs in communicator
   int cudaDev; // my cuda device index
@@ -616,16 +639,19 @@ struct ncclComm {
   int minCompCap, maxCompCap; // min/max compute capability in the communicator
   int64_t busId;   // my PCI bus ID in int format
   ncclAffinity cpuAffinity; // CPU affinity of the GPU
+                            // init/group 的异步线程会临时绑到这组 CPU 上，保证内存分配落在近端 NUMA
   int cudaArch; // matches __CUDA_ARCH__ of device
 
   int cpuArch;   // architecture - As defined in src/include/graph.h, e.g. x86/arm/ppc/mixed
   int cpuVendor; // vendor - As defined in src/include/graph.h
+                 // 两者经 AllGather3 归一：集群异构时统一置为 MIXED
 
+  // ============ rank 空间映射：全局 rank <-> 节点内 rank ============
   int node;
   int nNodes;
   int localRank;
   int localRanks;
-  int maxLocalRanks;
+  int maxLocalRanks; // 全局最大每节点 rank 数；== 1 时即 isOneRPN
   int minLocalRanks;
   int* rankToNode;
   int* rankToLocalRank;
@@ -633,42 +659,49 @@ struct ncclComm {
   // localRanks and localRanktoRank for all nodes
   struct ncclNodeRanks* nodeRanks;
   // MNNVL: Multi-Node NVLink
+  // 跨节点 NVLink：同一 clusterUuid+cliqueId 的 GPU 可像同机一样走 P2P
   int MNNVL; // true when MNNVL is available
   struct cliqueInfo clique; // Our MNNVL clique information
   int cliqueRank; // Our rank within the MNNVL clique
   int contiguousRanksPerHost; // Number contiguous ranks per host. INT_MAX if non-uniform.
 
   // NVL Domain info
-  ncclNvlDomainInfo_v5_t nvlDomainInfo;
+  ncclNvlDomainInfo_v5_t nvlDomainInfo; // domain 数与 min/max ranks per domain，传给 tuner plugin
 
-  ncclCheckMode_t checkMode;
+  // ============ 运行模式开关 ============
+  ncclCheckMode_t checkMode; // NCCL_CHECK_MODE/CHECK_POINTERS：参数校验强度，DEBUG_GLOBAL 时启用跨 rank 校验
   bool dmaBufSupport;
-  bool ccEnable;
+  bool ccEnable; // Confidential Computing 模式，开启时禁用 work FIFO
 
+  // ============ 操作计数器 ============
   // Counter for tracking CUDA launches (P2P and collectives included)
   uint64_t opCount;
   // Collective operation counter
-  uint64_t collOpCount;
+  uint64_t collOpCount; // 与 sharedRes->collOpCount 合成 proxy op id，用于 host/proxy 对齐同一次操作
 
+  // ============ Channel 数量与 buffer 尺寸配置 ============
   // Channels for collectives
   int nChannels; // connection nChannels
+                 // 建连用的 channel 数（ring/tree 图取 min 后跨 rank 对齐），enqueue 也以它为上限
   int collChannels; // enqueue nChannels
+                    // 现状：仅在 connect 阶段赋值（split-share 时被 parent 截断），暂无读取方
   int nvlsChannels; // enqueue nChannels
+                    // NVLS 专用上限，由 ncclNvlsTuning 独立算出，与 nChannels 解耦
   int nvlsTreeMaxChunkSize;
 
   // all nvls heads stored to check if we can splitShare
   int nvlsHeads[MAXCHANNELS];
   // Channels (per peer) for p2p
-  int p2pnChannels;
-  int p2pnChannelsPerPeer;
-  int p2pSchedGroupSize;
-  int p2pMaxPeers;
+  int p2pnChannels;        // P2P 专用 channel 池大小（>= nChannels）
+  int p2pnChannelsPerPeer; // 单个 peer 最多铺开几条并行 channel
+  int p2pSchedGroupSize;   // 多节点 P2P 的分组大小，决定每轮的 channel base
+  int p2pMaxPeers;         // 参与调度的并发 peer 上限
 
   // Should this comm allocate LL buffers for network P2P connections?
   bool allocP2pNetLLBuffers;
 
   // Buffer sizes
-  int buffSizes[NCCL_NUM_PROTOCOLS];
+  int buffSizes[NCCL_NUM_PROTOCOLS]; // LL/LL128/SIMPLE 各自的连接 buffer 大小；stepSize = buffSizes[p]/NCCL_STEPS
   int p2pChunkSize;
   int nvlsChunkSize;
 
@@ -680,63 +713,81 @@ struct ncclComm {
   // Tuner values
   struct ncclTuningContext_t tuningContext;
 
+  // ============ 异步错误与 abort ============
   /* This attribute can indicate the states of communicators and return code of
    * asynchronous NCCL operations. */
-  ncclResult_t asyncResult;
+  ncclResult_t asyncResult; // 非阻塞模式下由 ncclCommGetAsyncError 读出
 
   // Flag to ask NCCL kernels to abort
+  // abortFlag 是 host 可见副本，abortFlagDev 拷进 devComm 供 kernel 轮询，两者由 setCommAbortFlags 同写
   uint32_t* abortFlag;
   uint32_t* abortFlagDev;
-  int* abortFlagRefCount;
+  int* abortFlagRefCount; // split 共享 abort flag 时的引用计数
+  // 不共享 abort flag 时，父 comm 用这两个指针指向子 comm 的 flag，实现级联 abort
   uint32_t* childAbortFlag;
   uint32_t* childAbortFlagDev;
-  uint32_t destroyFlag;
-  uint32_t revokedFlag;
+  uint32_t destroyFlag; // ncclCommDestroy/Abort 入口置 1，挡住重复销毁
+  uint32_t revokedFlag; // ncclCommRevoke 置 1，之后不允许再 split 共享资源
 
+  // ============ Host -> Device：devComm 镜像与 work FIFO ============
   // Device side of the communicator (for cudaFree's)
   struct ncclKernelComm* devComm; // actually = &ncclKernelCommAndChannels::comm
 
   uint32_t workArgsBytes; // max size of kernel args
+                          // work 小到能塞进 kernel 参数时就不走 FIFO（ncclDevWorkStorageTypeArgs）
   uint32_t workFifoBytes; // size of workFifoBuf, power of 2
+  // 环形 buffer：host enqueue 侧写入 ncclDevWork*（生产者），kernel 侧读取（消费者）；
+  // 走 GDR 映射或 pinned host 内存，Dev 后缀是 device 侧地址
   void* workFifoBuf;
   void* workFifoBufDev;
   void* workFifoBufGdrHandle;
 
   // Monotonic number of bytes (mod 1<<32) sent to fifo.
+  // Produced 由 host 推进；Consumed 靠 kernel 完成事件回调补齐，二者之差即在途量，用于背压
   uint32_t workFifoProduced;
   uint32_t workFifoProducedLastRecorded;
   uint32_t workFifoConsumed;
 
+  // ============ 进程内多 comm 同步（sense-reversing barrier）============
+  // 同一进程管多张卡时，这些 comm 串成链表并用下面的 barrier 对齐 kernel launch。
+  // intraPad1/2 把 phase / counter / gate 隔到不同 cache line，避免 counter 的原子写和 gate 的自旋读互相打架
   // Intra-process sync
   struct ncclComm* intraComm0; // leader of intra-process comms (self possible)
   struct ncclComm* intraNext; // next of intra-process comms, intraComm0 is head
   int intraRank;
   int intraRanks;
-  uint32_t intraBarrierPhase;
+  uint32_t intraBarrierPhase; // 本地 sense 位，每过一次 barrier 翻转
   char intraPad1[64 - sizeof(uint64_t)];
   uint64_t intraBarrierCounter; // only used if this is intraComm0
   char intraPad2[64 - sizeof(uint64_t)];
   uint64_t intraBarrierGate; // only used if this is intraComm0
 
-  struct ncclProxyState* proxyState;
+  // ============ Proxy ============
+  struct ncclProxyState* proxyState; // proxy 线程及其连接/进度状态，split 时可与父共享
   int proxyRefCountOld; /* store proxy post-atomic-sub refcount */
+                        // 原子减之后的旧值，为 0 才真正停线程
+
+  // ============ CollNet（in-network reduction）============
   // Whether this communicator uses collNet
-  bool isOneRPN;
-  uint8_t collNetSupportMatrix[4 /*sum,prod,max,min*/][ncclNumTypes];
-  int* collNetHeads;
+  bool isOneRPN; // maxLocalRanks == 1，即每节点仅一张卡
+  uint8_t collNetSupportMatrix[4 /*sum,prod,max,min*/][ncclNumTypes]; // 各 (redop,dtype) 是否所有 head 都支持
+  int* collNetHeads;    // 各节点的 CollNet head rank 列表
   int collNetHeadsNum;
   int collNetChainSupport;
   // Node-major rank order with transport heads first on each node.
+  // dense rank -> user rank 的逆映射，PAT/rail 连接与 device 侧寻址都依赖它
   int* denseToUserRank;
   /* sharable collNet proxy progress resource. */
   struct ncclCollNetSharedRes* collNetSharedRes;
 
   // NVLink SHARP (NVLS) support
-  int nvlsSupport;
-  int nvlsRegSupport;
+  int nvlsSupport;    // 硬件 multicast + 拓扑检查的结果
+  int nvlsRegSupport; // 能否注册用户 buffer 到 NVLS（同进程多 rank 或 MNNVL 会被关掉）
   /* sharable NVLS resource. */
   struct ncclNvlsSharedRes* nvlsResources;
 
+  // ============ 任务对象池（backing 全部来自 memPermanent）============
+  // 大部分池在 reclaimPlan() 里随 kernel plan 一起归还，Rma 池例外（RMA 执行完就地归还）
   // pools backed by comm->memPermanent
   struct ncclMemoryPool memPool_ncclTaskBcast;
   struct ncclMemoryPool memPool_ncclTaskColl;
@@ -746,54 +797,65 @@ struct ncclComm {
   struct ncclMemoryPool memPool_ncclProxyOp;
   struct ncclMemoryPool memPool_ncclKernelPlan;
 
+  // ============ Group 聚合与 enqueue 流水线 ============
+  // 一次 groupEnd 的处理链：rawTaskQueue -> (pretuning/tuning/classify) -> classifiedTaskQueues
+  //                        -> posttuning -> planner -> kernel launch + proxy 上传
   // Next comm in this thread's active ncclGroup[Start|End](). Holds "0x1" when
   // this comm is not yet in a group.
   struct ncclComm* groupNext[ncclGroupTaskTypeNum];
   // Subset of those in groupNext list. Holds 0x1 if not needing preconnect.
   struct ncclComm* preconnectNext;
   int localPersistentRefs; // number of persistent plan-lists capturing this comm
+                           // 被 CUDA Graph 捕获的 plan 数，destroy 时要自旋等它归零
+  // 长度 nRanks 的轮次表：第 r 轮和谁发、和谁收，决定 P2P 的 channel 映射顺序
   struct P2pSchedulePair {
     int sendRank;
     int recvRank;
   }* p2pSchedule;
 
-  struct ncclKernelPlanner planner;
-  struct ncclRawTaskQueue rawTaskQueue;
-  struct ncclClassifiedTaskQueues classifiedTaskQueues;
+  struct ncclKernelPlanner planner;                     // task 累积 -> plan 构建 -> 待发射 plan 队列
+  struct ncclRawTaskQueue rawTaskQueue;                 // API 刚入队、尚未调优的原始 task
+  struct ncclClassifiedTaskQueues classifiedTaskQueues; // 调优后按执行路径分流（sym/legacy/p2p/rma/ce...）
   // Queue of management tasks (comm init/destroy/finalize/etc.) enqueued for this
   // comm during a ncclGroup[Start|End]() scope.
   struct ncclIntruQueue<struct ncclAsyncJob, &ncclAsyncJob::next> mgmtTaskQueue;
-  bool simulationMode;
+  bool simulationMode; // 目前无任何读写点，预留字段
   void* ringTasks; // An array of nRanks pointers used in ring sorting rooted collectives (bcast)
 
-  cudaMemPool_t memPool;
+  // ============ 异步回收与回调 ============
+  cudaMemPool_t memPool; // 本 GPU 的 cudaMallocAsync 池，供 persistent/graph 模式分配 device work buffer
   // Queue of events and associated callbacks for cleaning up asynchronous work.
   // Using this is preferable to using CUDA host callbacks because host callbacks
   // won't allow the work following the callback to run until the callback completes,
   // which comes at expense to perf.
+  // 主线程 poll 时用 cudaEventQuery 探测，就绪才跑回调
   struct ncclIntruQueue<struct ncclCommEventCallback, &ncclCommEventCallback::next> eventCallbackQueue;
 
   // user-created reduction ops
+  // freelist 数组：freeHead 指向下一个空槽，handle 与 comm 地址做 mangle 防跨 comm 误用
   int userRedOpCapacity, userRedOpFreeHead;
   ncclUserRedOp* userRedOps;
 
   // Queue of things for the main thread to do
-  int reclaimSteps;
+  int reclaimSteps; // groupEnd 每处理一个 comm +1，攒够阈值就顺手 poll 一次 callbackQueue
+  // MPSC：其它线程（host stream 回调等）投递 plan 回收请求，主线程单消费
   struct ncclIntruQueueMpsc<struct ncclCommCallback, &ncclCommCallback::next> callbackQueue;
 
+  // ============ 生命周期状态机 ============
   ncclConfig_t config;
   // initState is to more conveniently reclaim resources when errors happen.
-  ncclResult_t initState;
+  ncclResult_t initState; // ncclInProgress -> ncclSuccess / 错误码
   // flag to indicate if ncclCommFinalize() is called
   bool finalizeCalled;
   // shared structures for finalization
-  int finalizeRankCnt;
+  int finalizeRankCnt; // 仅 intraComm0 使用：同进程多 rank 销毁时的到达计数
   // group job to support multi-thread FT
   struct ncclGroupJob* groupJob;
 
   // Flag indicating if this communicator shares resources with parent or children
   bool shareResources;
 
+  // ============ 可插拔插件 ============
   // Tuning plugin
   int tunerPluginLoaded;
   ncclTuner_t* tuner;
@@ -801,45 +863,54 @@ struct ncclComm {
 
   // Profiler plugin
   void* profilerContext;
-  uint64_t seqNumber[NCCL_NUM_FUNCTIONS];
+  uint64_t seqNumber[NCCL_NUM_FUNCTIONS]; // 按 collective 类型单调递增，profiler/RAS 用它对齐事件
   struct ncclProfilerCommState profiler;
 
+  // ============ RMA / Debug / CE collective ============
   // RMA state
-  struct ncclRmaState rmaState;
+  struct ncclRmaState rmaState; // RMA proxy 线程态 + CE 侧 RMA context
+  // 首个 symmetric window 注册时入队，groupEnd 时才真正 ncclRmaCeInit（延迟初始化）
   struct ncclIntruQueue<struct ncclRmaCeInitTask, &ncclRmaCeInitTask::next> rmaCeInitTaskQueue;
 
   // Debug check
+  // checkMode == DEBUG_GLOBAL 时存参数快照，groupEnd 起异步 job 做跨 rank 一致性校验
   struct ncclIntruQueue<struct ncclArgsInfo, &ncclArgsInfo::next> argsInfoQueue;
 
   // CE Collective
-  struct ncclCeColl ceColl;
+  struct ncclCeColl ceColl; // 用 Copy Engine 而非 SM 执行的 collective 状态
   struct ncclIntruQueue<struct ncclCeInitTask, &ncclCeInitTask::next> ceInitTaskQueue;
 
+  // ============ 注册缓存与全局能力汇总（下面这批多为 AllGather 后的归约结果）============
   // buffer registration cache
-  struct ncclRegCache regCache;
-  int isAllNvlink;
+  struct ncclRegCache regCache; // 用户 buffer 注册缓存，按页对齐区间索引，避免重复注册 MR/IPC
+  int isAllNvlink;        // 全体 GPU 路径 <= PATH_PIX（允许经 NVSwitch 间接）
   bool isAllDirectP2p; // Subject to NCCL_P2P_LEVEL (for local ranks only).
   bool isAllCudaP2p; // Raw CUDA capability (for local ranks only).
   bool isAllDirectNvlink; // All GPUs are directly connected to each other through NVLink.
-  int symmetricSupport;
-  int gpuCftSupport;
-  bool useNetPXN;
-  bool useGdr;
+                          // 比 isAllNvlink 更严：必须 <= PATH_NVL 直连
+  int symmetricSupport; // 对称内存总开关，由 isAllCudaP2p + cuMem + GIN 能力共同决定
+  int gpuCftSupport;    // 全体取 min，见 peerInfo 同名字段
+  bool useNetPXN;       // 是否用了跨 GPU 的 net proxy（全局 OR）
+  bool useGdr;          // 全体 net 连接是否都启用了 GDR（全局 AND）
   bool hasMloPart; // if mlopart is used
   bool hasMultiRankNvml; // if multiple ranks are using the NVML device
-  ncclGinConnectionType_t globalGinSupport;
+  ncclGinConnectionType_t globalGinSupport; // NONE / RAIL / FULL
   bool globalRmaProxySupport;
   bool hostRmaSupport;
-  int childCount;
+  int childCount; // 已派生的子 comm 数，用来给子 comm 派生唯一 magic/commHash
 
+  // ============ 对称内存运行时 ============
   struct ncclDevrState devrState; // The symmetric runtime state
   struct ncclSymkState symkState; // The symmetric kernels state (built on previous)
 
+  // ============ 显存管理器 ============
+  // 所有 ncclCudaMalloc 类分配都经它记账（persist/scratch/offload/peer import），split-share 时可复用父实例
   struct ncclMemManager* memManager;  // Memory manager
+  // ncclCommSuspend/Resume 的延迟执行队列，groupEnd 时 drain
   struct ncclIntruQueue<struct ncclMemManagerTask, &ncclMemManagerTask::next> suspendTaskQueue;
   struct ncclIntruQueue<struct ncclMemManagerTask, &ncclMemManagerTask::next> resumeTaskQueue;
 
-  uint64_t endMagic;
+  uint64_t endMagic; // 与 startMagic 配对的尾哨兵
 };
 
 static_assert(offsetof(struct ncclComm, startMagic) == 0, "startMagic must be the first field of ncclComm");
