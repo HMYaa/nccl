@@ -183,24 +183,90 @@ ncclResult_t ncclTopoSearchInit(struct ncclTopoSystem* system);
 #define NCCL_TOPO_PATTERN_RING 4            // Ring
 #define NCCL_TOPO_PATTERN_NVLS 5            // NVLS+SHARP and NVLS+Tree
 #define NCCL_TOPO_PATTERN_COLLNET_DIRECT 6  // Collnet Direct
+
+/*
+一句话定义
+
+  ncclTopoGraph 是一次拓扑搜索的请求单 + 结果单：ncclTopoCompute 拿着 Input 字段当约束，在本节点的 ncclTopoSystem 上搜出一组"GPU 怎么串成链 + 从哪张网卡进出"的方案，写回 Output 字段。
+
+  大白话类比
+
+  像给旅行社下的行程委托单：
+
+  • 上半部分是你的要求：走环线还是树形（pattern）、最少几条线路（minChannels）、能不能从不同机场进出（crossNic）
+  • 下半部分是旅行社填回来的方案：实际排了几条线（nChannels）、每条线的途经城市顺序（intra）、进出机场（inter）、这条线能跑多快（bwIntra/bwInter）
+
+  关键在于同一张单子既是输入又是输出，而且旅行社在报不出价时会自己放宽你的要求（降带宽、放松路径类型），然后把放宽后的实际值填回单子——所以你交出去的约束和拿回来的值可能不一样。
+
+  物理逻辑
+
+  四个层次：
+
+     1 │ Input 约束                          搜索                        Output 解
+     2 │ ┌──────────────┐         ┌────────────────────────┐      ┌──────────────────┐
+     3 │ │ pattern      │────────▶│ ncclTopoSearchRec      │─────▶│ nChannels        │
+     4 │ │ min/maxChan  │         │  (DFS + 回溯 + 超时)    │      │ intra[] inter[]  │
+     5 │ │ crossNic     │         │                        │      │ bw/type/nHops    │
+     6 │ │ collNet      │         │ 沿 path 扣带宽，不够就   │      └──────────────────┘
+     7 │ └──────────────┘         │ rewind（followPath）    │
+     8 │                          └────────────────────────┘
+     9 │                                    │ 搜不到就放宽，逐级降级：
+    10 │                                    ▼
+    11 │    sameChannels 1→0 ▶ pattern 简化 ▶ typeIntra++ ▶ typeInter++ ▶ crossNic ▶ bw 降档
+
+  intra / inter 的内存布局是这个结构最容易看错的地方：
+
+     1 │        channel 0                channel 1               ...
+     2 │intra:  [r0 r1 r2 r3 ... r_ngpus-1][r0 r1 r2 ...        ]   stride = ngpus(本节点GPU数)
+     3 │         └── 本节点内的 GPU 串行顺序，存 rank 号 ──┘
+     4 │
+     5 │inter:  [ netIn  netOut ][ netIn  netOut ]              ...   stride = 2
+     6 │          进            出
+     7 │        NET node id = (systemId << ...) | localId  ← 所以是 int64_t 而非 int
+
+  三个必须抓住的物理约束：
+
+  这是节点局部视角，不是全局视图。 intra 的 stride 是本节点 GPU 数（connect.cc 用 c * localRanks，search.cc 用 c * ngpus，两者必须相等），数组开到 NCCL_TOPO_MAX_NODES(640) 只是静态上界。全局的环要靠
+  ncclTopoPostset 把各节点的段首尾相接才拼出来。
+
+  搜索是"扣带宽 + 回溯"，不是打分排序。 followPath 沿路径把 bwIntra/bwInter 从每条 link 的余量里真实扣掉，扣不动就 rewind 退回去。所以 bwIntra 既是约束又是结果——它是"我要求每 channel
+  有这么多带宽"，搜索成功后就成了"每 channel 实际有这么多带宽"。
+
+  降级顺序编码了性能偏好。 先放宽 sameChannels（结构对称性最便宜），再简化 pattern，再放宽路径类型（typeIntra 先于 typeInter，因为节点内绕远比跨节点绕远代价低），最后才降带宽档位。而 pass 2
+  会反向尝试提升带宽——先找到可行解，再在可行解附近爬坡。
+
+  跨节点必须归一化。 每个节点独立搜索，结果可能不同；init.cc 在 allgather 后对所有 rank 取保守值：带宽和 nChannels 取 min，路径类型取 max（越大越松），保证全 communicator 的 tuning 模型一致。
+*/
+
+// 某一种算法在「本节点」拓扑上的搜索请求 + 搜索结果。
+// ncclTopoCompute 以 Input 字段为约束在 ncclTopoSystem 上做带回溯的搜索，把最优解写回
+// Output 字段；一个 communicator 为 ring/tree/collnet/nvls 各算一份，存在 comm->graphs[]。
+// 注意这里描述的是「本节点内 GPU 怎么串 + 从哪张网卡进出」，跨节点的 rank 拼接由
+// ncclTopoPreset/ncclTopoPostset 完成。
 struct ncclTopoGraph {
   // Input / output
+  // 搜索标签，同时用于匹配 NCCL_GRAPH_FILE 里的 <graph id=...>。
+  // 注意它不等于 comm->graphs[] 的下标（NCCL_ALGO_*），别拿来当索引用。
   int id; // ring : 0, tree : 1, collnet : 2, nvls : 3, collnetDirect : 4
-  int pattern;
-  int crossNic;
-  int collNet;
-  int minChannels;
-  int maxChannels;
+  int pattern;     // NCCL_TOPO_PATTERN_*，决定 NIC 流量怎么摊到 GPU 上；搜索会降级改写它
+  int crossNic;    // 入口/出口是否允许用不同网卡（0/1/2，由 NCCL_CROSS_NIC 与 pattern 共同决定）
+  int collNet;     // 纯输入：是否为 collnet 图，影响搜索时对 NIC 的处理
+  int minChannels; // 可接受的 channel 数下界，某些 pattern 会被改写（如 NVLS 强制拉满）
+  int maxChannels; // 上界，同上；ring 用 MAXCHANNELS/2 留一半给 tree
   // Output
-  int nChannels;
-  float bwIntra;
-  float bwInter;
-  float latencyInter;
-  int typeIntra;
-  int typeInter;
-  int sameChannels;
-  int nHops;
+  int nChannels;      // 实际搜到的 channel 数，0 表示该算法在本拓扑上不可用
+  float bwIntra;      // 单 channel 节点内可用带宽 (GB/s)，搜索时按候选速度档逐级下调
+  float bwInter;      // 单 channel 跨节点可用带宽 (GB/s)
+  float latencyInter; // 出口网卡的固有延迟，供 tuning 模型算 interLat
+  int typeIntra;      // 节点内允许的最差路径类型 (PATH_*)，越大越松
+  int typeInter;      // GPU 到 NIC 允许的最差路径类型 (PATH_*)
+  int sameChannels;   // 1 = 所有 channel 用同一条 GPU 序列；放开为 0 可换更高带宽
+  int nHops;          // 解的总跳数，带宽相同时作为次级择优指标
+  // channel c 的节点内 GPU 序列：intra[c * ngpus + i] 存 rank 号，ngpus 为本节点 GPU 数
+  // （即 localRanks）。数组按 NCCL_TOPO_MAX_NODES 开满，实际只用前 nChannels * ngpus 项。
   int intra[MAXCHANNELS * NCCL_TOPO_MAX_NODES];
+  // channel c 的入口/出口网卡：inter[c*2+0] 进、inter[c*2+1] 出，存的是 NET node id
+  // （高位 systemId + 低位 localId，故为 int64_t），-1 表示无网卡可用
   int64_t inter[MAXCHANNELS * 2];
 };
 ncclResult_t ncclTopoCompute(struct ncclTopoSystem* system, struct ncclTopoGraph* graph);
