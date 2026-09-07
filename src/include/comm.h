@@ -562,6 +562,93 @@ typedef enum ncclCheckMode {
   ncclCheckModeDebugGlobal = 2,
 } ncclCheckMode_t;
 
+/*
+NCCL 的数据结构不是平铺关系，而是围绕每个 rank-local 的 ncclComm，沿两条主轴逐步降维：
+  初始化轴：成员信息 → 物理拓扑 → 算法拓扑 → Channel → 具体连接
+  执行轴：API 请求 → Task → Kernel Plan → GPU Work + Proxy Work
+
+  ### 1. 技术定义
+
+  ncclComm 是单个 rank 在本进程中的 Host runtime 根对象。不同 rank 各自拥有独立实例，不存在跨进程共享
+  的中央 ncclComm。
+
+  Global view
+
+  Rank 0 process             Rank 1 process             Rank 2 process
+  ┌──────────────┐          ┌──────────────┐          ┌──────────────┐
+  │ ncclComm R0  │          │ ncclComm R1  │          │ ncclComm R2  │
+  └──────┬───────┘          └──────┬───────┘          └──────┬───────┘
+         └──────── bootstrap / transport / GPU ───────────────┘
+
+  ### 2. 大白话模型
+
+  把一个 rank 的 ncclComm 想成通信运行时机柜：
+
+  ncclComm
+  ├── 身份与控制面：bootstrapState、peerInfo[]
+  ├── 物理地图：ncclTopoSystem
+  ├── 算法路线：ncclTopoGraph[]
+  ├── 通信车道：ncclChannel[]
+  ├── 具体端点：ncclConnector / ncclConnInfo
+  ├── Host 调度：ncclKernelPlanner / ncclKernelPlan
+  ├── GPU 快照：ncclKernelComm / ncclDevWork*
+  └── 网络推进：ncclProxy* → ncclNet → ncclIbRequest
+
+  ### 3. 初始化构造轴
+
+  bootstrapState
+        │ Host 控制面交换
+        ▼
+  peerInfo[nRanks]
+        │ 每个 rank 的 GPU/Host/能力名片
+        ▼
+  ncclTopoSystem
+        │ 物理节点、link、预计算 path
+        ▼
+  ncclTopoGraph[algorithm]
+        │ Ring/Tree 等算法需要的 channel 排布
+        ▼
+  ncclChannel[channelId]
+        │ 当前 rank 在此 channel 的 prev/next/up/down
+        ▼
+  ncclChannelPeer[peer]
+        │
+        ├── send[connIndex] : ncclConnector
+        └── recv[connIndex] : ncclConnector
+                                │
+                                ▼
+                           ncclConnInfo
+                           GPU 可见连接描述
+
+  核心结构：
+
+   结构              回答的问题                                    生命周期/位置
+  ━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   ncclComm          本 rank 的 NCCL runtime 状态是什么            communicator 生命周期，Host
+  ────────────────  ────────────────────────────────────────────  ─────────────────────────────
+   bootstrapState    初始化控制消息怎样找到其他 rank               初始化控制面，Host
+  ────────────────  ────────────────────────────────────────────  ─────────────────────────────
+   ncclPeerInfo[]    每个 rank 在哪个 Host/GPU，支持什么能力       AllGather 后保存在每个 rank
+  ────────────────  ────────────────────────────────────────────  ─────────────────────────────
+   ncclTopoSystem    系统里有哪些 GPU/NIC/PCI/CPU，怎样物理连接    初始化生成，Host
+  ────────────────  ────────────────────────────────────────────  ─────────────────────────────
+   ncclTopoGraph     某种算法怎样使用物理拓扑和 channels           graph search 输出，Host
+  ────────────────  ────────────────────────────────────────────  ─────────────────────────────
+   ncclChannel       当前 rank 在一个并行车道中的邻居是谁          communicator 生命周期
+  ────────────────  ────────────────────────────────────────────  ─────────────────────────────
+   ncclConnector     某个 channel-peer-direction 的连接实例        Host
+  ────────────────  ────────────────────────────────────────────  ─────────────────────────────
+   ncclConnInfo      GPU 怎样访问 buffer/head/tail/FIFO            Host 构造后复制到 GPU
+
+  最关键的三级区别：
+
+  ncclTopoSystem：系统里有什么、物理上怎么连
+  ncclTopoGraph ：某种算法准备怎么走
+  ncclChannel   ：落实到本 rank 后，我的上下游是谁
+
+
+*/
+
 // 通信域的中枢对象：一个 rank 的全部 host 侧状态。生命周期 = ncclCommInitRank .. ncclCommDestroy。
 // 阅读提示：字段大致按"init 阶段填充顺序"排列，下面按功能域分块标注。
 // 注意：布局对 devComm 拷贝、cache line padding（intraPad*）和首尾 magic 校验敏感，不要随意重排字段。
