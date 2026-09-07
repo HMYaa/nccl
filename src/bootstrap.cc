@@ -480,6 +480,8 @@ ncclResult_t bcastGrowHandle(struct ncclBootstrapHandle* handle, struct ncclComm
   return ncclSuccess;
 }
 
+// P2P accept 无法指定来源：内核只能给出"下一个到达的连接"。因此一条已建立但
+// (peer, tag) 与当前 recv 期望不符的连接会被挂到这里，等真正的 recv 来取。
 struct unexConn {
   int peer;
   int tag;
@@ -487,21 +489,27 @@ struct unexConn {
   struct unexConn* next;
 };
 
+// bootstrap 环上本 rank 的两条腿：send 指向 next rank，recv 来自 prev rank。
+// union 二选一由 NCCL_BOOTSTRAP_NET_ENABLE 决定，且全 communicator 一致。
 struct bootstrapRing_t {
   union {
     struct {
+      // net plugin 的 comm 句柄，数据走 isend/irecv + test 轮询
       void *sendComm, *recvComm;
       ncclNetDeviceHandle_t *sendDevHandle, *recvDevHandle;
     } net;
     struct {
+      // 阻塞式 TCP，数据走 socketSend/socketRecv
       struct ncclSocket recv;
       struct ncclSocket send;
     } socket;
   };
 };
+// 本 rank 的被动端点集合：环上前驱和任意 peer 靠这些地址找到我。
 struct bootstrapListen_t {
   struct ncclSocket peerSocket; // socket for peers to contact me in P2P
   union {
+    // net 模式：dev 是 OOB 网卡，comm 是 listen comm，handle 是要广告给前驱的连接信息
     struct {
       int dev;
       void* comm;
@@ -511,19 +519,63 @@ struct bootstrapListen_t {
   };
 };
 
+/*
+一句话定义:
+bootstrapState 是一个 communicator 的带外控制面句柄：它用一条 TCP（或 OOB 网卡）串成的逻辑环，完成 rank 会合和初始化期元数据交换，然后把交换到的地址表交给 proxy/transport 去建真正的数据面。
+
+大白话类比:
+
+  把它想成「新公司入职当天的联络簿」：
+
+  • ring 是你左右两位同事的电话（只认识邻居，靠传话完成全员通知）
+  • listen 是你自己的电话号码（别人打进来）
+  • 三张 peer*Addresses 数组是传完话之后你手上那份全员通讯录
+  • unexpectedConnections 是"有人先打进来但你还没准备接这个话题"的留言箱
+
+物理逻辑:
+ 三个层次，字段按层次归组：
+
+     1 │                传输底座（二选一，NCCL_BOOTSTRAP_NET_ENABLE 决定）
+     2 │  ┌───────────────────────────────────────────────────────────────┐
+     3 │  │  net 模式:   net->isend/irecv + test 轮询（走 OOB NIC）        │
+     4 │  │  socket 模式: socketSend/socketRecv（阻塞 TCP）                │
+     5 │  └───────────────────────────────────────────────────────────────┘
+     6 │
+     7 │                        环拓扑（rank / nranks 定义）
+     8 │   rank-1  ──send──▶ ┌──────────── rank ────────────┐ ──send──▶ rank+1
+     9 │                     │ listen.socket / listen.net   │
+    10 │      recv ◀─────────│ ring.recv        ring.send   │◀───────── recv
+    11 │                     └──────────────────────────────┘
+    12 │   环用于 bootstrapAllGather：nranks-1 步，每步转发一片，O(N) 消息、O(N·size) 时间
+    13 │
+    14 │                        环之上跑出来的三张全局表
+    15 │   ringAllInfo() 打包 {peerAddress, peerProxy, peerUDS, rasRank} 一次 allgather
+    16 │   ┌────────────────────────┬──────────────────────────────────────┐
+    17 │   │ peerP2pAddresses[N]    │ 各 rank 的 listen.peerSocket 地址     │
+    18 │   │                        │ → bootstrapSend/Recv 绕过环直连       │
+    19 │   │ peerProxyAddresses[N]  │ 各 rank proxy service 的 TCP 地址     │
+    20 │   │ peerProxyAddressesUDS[N]│ abstract UDS id (pidHash+rand)      │
+    21 │   │                        │ → 同节点 proxy 间用 UDS 传 fd         │
+    22 │   └────────────────────────┴──────────────────────────────────────┘
+
+*/
+
+// communicator 的 out-of-band 控制面句柄，挂在 comm->bootstrap 上。
+// 只负责 rank 会合与初始化期的元数据交换（allgather/barrier/send/recv），
+// 不承载 collective 数据；ncclComm 的 channel/proxy 建立起来后它就只剩管理用途。
 struct bootstrapState {
-  struct bootstrapRing_t ring;
-  struct bootstrapListen_t listen;
-  ncclNet_t* net;
-  uint64_t* peerProxyAddressesUDS;
-  union ncclSocketAddress* peerProxyAddresses;
-  union ncclSocketAddress* peerP2pAddresses;
-  struct unexConn* unexpectedConnections;
-  int cudaDev;
-  int rank;
+  struct bootstrapRing_t ring;      // 环上主动侧连接，allgather/barrier 的传输底座
+  struct bootstrapListen_t listen;  // 环上被动侧 + P2P 被动侧端点
+  ncclNet_t* net;                   // = comm->ncclNet，仅 net 模式下用它的 listen/connect/isend/...
+  uint64_t* peerProxyAddressesUDS;  // [nranks] 各 rank proxy 的 abstract UDS id，同节点传 fd 用。特殊场景：在同一台机器的不同进程之间传递 FD，让它们共享同一个内核/CUDA 内存对象。
+  union ncclSocketAddress* peerProxyAddresses; // [nranks] 各 rank proxy service 的 TCP 监听地址
+  union ncclSocketAddress* peerP2pAddresses;   // [nranks] 各 rank listen.peerSocket 地址，点对点直连用
+  struct unexConn* unexpectedConnections;      // 早到连接的暂存队列，见 unexConn
+  int cudaDev;                      // 仅记录归属 GPU，用于诊断上下文
+  int rank;                         // 环上位置：next = (rank+1)%nranks，prev = (rank-1+nranks)%nranks
   int nranks;
-  uint64_t magic;
-  volatile uint32_t* abortFlag;
+  uint64_t magic;                   // bootstrap 会话 id，socket 握手时校验，避免不同 comm 串线
+  volatile uint32_t* abortFlag;     // = comm->abortFlag，所有阻塞循环轮询它来跳出
 };
 #define STATE_RING(s, f) (s->ring.f)
 #define STATE_LISTEN(s, f) (s->listen.f)
