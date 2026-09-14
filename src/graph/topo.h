@@ -166,7 +166,7 @@ struct ncclTopoNode {
   };
   int nlinks;
   struct ncclTopoLink links[NCCL_TOPO_MAX_LINKS];  // 邻接表，表示边
-  // Pre-computed paths to GPUs and NICs
+  // Pre-computed paths to GPUs and NICs   从当前这个 node 出发，到“类型为 t 的第 j 个节点”的路径。
   // 按目标类型分组的寻址表」——paths[t][j] = 从本节点到 nodes[t].nodes[j] 的预计算最优路径（hop 链 + 瓶颈带宽 + PATH 等级）。不是物理边，是算法用的路由缓存。
   // paths[NET][2] │ 从我家到「第 3 个 NET 站点」的路线
   /*  稀疏分配
