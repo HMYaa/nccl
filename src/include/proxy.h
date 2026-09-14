@@ -69,13 +69,16 @@ union ncclProxyOpSpecifics {
   } bcast;
 };
 
+// 「快递单」三层级之一：主线程 -> proxy 线程的跨线程「订单」。
+// 按 channel、连接方向及任务生成，经共享 ncclProxyOpsPool 交给负责该连接的 Proxy；
+// 纯参数、无进度状态。proxy 线程取出后合并成 ncclProxyArgs（批）+ ncclProxySubArgs（状态机）。
 struct ncclProxyOp {
-  struct ncclProxyConnection* connection;
-  ssize_t nbytes;
-  uint64_t opCount;
+  struct ncclProxyConnection* connection; // 目标连接（proxy 侧对某条 ncclConnector 的映射）
+  ssize_t nbytes;                         // 传输字节参数；含义需结合算法及 progress 的分块/注册路径
+  uint64_t opCount;                       // 操作排序/合批标识，编码区分 collective 与 P2P
   int root;
-  int next;
-  int nsteps;
+  int next;                               // ops pool 内的链表下标
+  int nsteps;                             // 本次任务的 step 工作量；按 sliceSteps 等粒度推进
   size_t chunkSize;
   size_t sliceSize;
   size_t loopSize;
@@ -126,9 +129,19 @@ struct ncclProxyEventHandle {
   struct ncclProxySubArgs* subArgPtr;
 };
 
+// 「快递单」最小单元：一条连接上的传输任务及其进度。
+// NET 中 base 是连接的绝对 step 起点，posted/received/transmitted/done 从 0 开始计相对进度；
+// 访问连接计数器或 buffer 环槽时再加 base，不能写成 base <= done。
+//
+//   NET send：posted（提供 GPU 生产窗口）-> transmitted（数据就绪且 isend 提交）-> done（test 完成）
+//   NET recv：posted（irecv 提交）-> received（接收完成）-> transmitted（完成所需 flush 后发布 tail）
+//             -> done（GPU 消费完毕，回收窗口）
+// NET recv 不单独推进 flushed；CollNet 等实现使用该字段，不能跨 transport 套用同一计数链。
+// requests 保存网络插件的异步 request，不等同于 Verbs WQE；槽位索引和有效并发深度由 progress 决定。
 struct ncclProxySubArgs {
-  struct ncclProxyConnection* connection;
-  int reg;
+  // ---- (a) 目标 ----
+  struct ncclProxyConnection* connection; // 该 sub 服务的 Proxy 连接，关联 transportResources 与推进实现
+  int reg;                                // 用户 buffer 已注册（零拷贝路径）
   // collnet handles
   void* sendMhandle;
   void* recvMhandle;
@@ -138,22 +151,24 @@ struct ncclProxySubArgs {
   ssize_t loopSize;
   ssize_t loopOffset;
   int channelId;
-  int nsteps;
+  // ---- (b) 任务量 ----
+  int nsteps;                             // 总步数
   ssize_t nbytes;
   ssize_t chunkSize;
   int peer;
   int isOneRPN;
   RingAlgorithm* ringAlgo;
   int groupSize; // Number of consecutive sub operations sharing the same recvComm
-  uint64_t base;
+  // ---- (c) 进度字段：使用哪些计数器由 transport 决定 ----
+  uint64_t base;                          // NET 中由 resources->step 按 chunkSteps 向上对齐得到的绝对起点
   uint64_t posted;
   uint64_t received;
-  uint64_t flushed;
+  uint64_t flushed;                      // CollNet 等路径使用；NET recv 不单独推进
   uint64_t transmitted;
   uint64_t done;
-  uint64_t end;
+  uint64_t end;                           // 不作为 NET progress 的完成判据；NET 使用 nsteps 与相对进度
   int regBufferReady;
-  void* requests[NCCL_STEPS];
+  void* requests[NCCL_STEPS];             // 插件异步请求槽；send/recv 分组与阶段可采用不同的索引方式
 
   // Profiler plugin
   int eActivationMask;
@@ -171,12 +186,16 @@ struct ncclProxySubArgs {
   int recvRequestsSubCount;
 };
 
+// 「快递单」中间层：Proxy 合批后的 sub 集合，共用 progress 与操作参数；也可承载 P2P。
+// progressOps 遍历 active 链，调用 args->progress(proxyState, args) 推进该批 subs。
 struct ncclProxyArgs {
+  // ---- (a) 批 ----
   struct ncclProxySubArgs subs[NCCL_PROXY_MAX_SUBS];
-  proxyProgressFunc_t progress;
+  proxyProgressFunc_t progress;           // 该批用哪个 transport 的推进函数（如 net.cc 的 sendProxyProgress）
   int nsubs;
-  int done;
+  int done;                               // 已完成的 sub 数；== nsubs 时整批结束
   int onePPN;
+  // ---- (b) 本批操作的公共参数（来自 ncclProxyOp）----
   uint64_t opCount;
   int sliceSteps;
   int chunkSteps;
@@ -192,18 +211,20 @@ struct ncclProxyArgs {
   uint8_t /*ncclFunc_t*/ collAPI;
   uint8_t protocol;
   uint8_t algorithm;
-  int state;
-  char* sharedBuff[NCCL_STEPS];
+  // ---- (c) 状态 ----
+  int state;                              // ncclProxyOpReady -> ncclProxyOpProgress -> ncclProxyOpNone
+  char* sharedBuff[NCCL_STEPS];           // 共享 buffer 模式的每步暂存区
   int sharedSize[NCCL_STEPS];
   int nChannels;
   int nPeers;
 
-  int idle;
+  int idle;                               // 本轮是否毫无推进；连续 idle 时 proxy 线程 backoff
 
+  // ---- (d) 链表 ----
   // Element linking
-  struct ncclProxyArgs* next;
-  struct ncclProxyArgs* nextPeer;
-  struct ncclProxyArgs** proxyAppendPtr;
+  struct ncclProxyArgs* next;             // active 链（progressOps 遍历）
+  struct ncclProxyArgs* nextPeer;         // 同一 proxyAppendPtr 队列上的下一批，保证该队列 FIFO
+  struct ncclProxyArgs** proxyAppendPtr;  // 队列尾指针；可为连接私有，也可指向 transport 的共享队列
 
   union ncclProxyOpSpecifics specifics;
 };
