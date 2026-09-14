@@ -131,26 +131,40 @@ static_assert(NCCL_LL_CLEAN_MASK % NCCL_STEPS == 0, "Invalid NCCL_LL_CLEAN_MASK 
 #define NCCL_NVLS_REG_BUFFER 0x02
 #define NCCL_NET_REG_BUFFER 0x04
 
+// 「连接契约」：供 GPU primitive 使用的 buffer、同步状态与 direct/网络扩展信息。
+// transport 建立连接后，将 Host connector 中的 conn 拷入 ncclDevChannelPeer。
+// buffer 位置和同步方式取决于 transport/protocol：P2P read 的 Simple buffer 在发送端；
+// NET 通常通过本地 GPU 与 Proxy 的缓冲、计数器交接，再由网络搬运数据。
+//
+// 普通 P2P write + Simple 的单步简化模型（不含 direct、共享 buffer 与 slice 聚合）：
+//   sender 等 head 信用 -> 写接收侧 buffer -> 发布 tail
+//   receiver 等 tail   -> 读 buffer       -> 更新发送侧 head
+// LL/LL128 还使用数据内的 flag，不能把 tail 等待推广为所有协议的数据就绪条件。
 struct ncclConnInfo {
+  // ---- (a) 数据 buffer：按协议（LL / LL128 / Simple）索引，是否分配及是否共享由 transport 决定 ----
   // Regular comm mechanism
   // GPU side: send/recv buffer, head/tail, step, flags
-  char* buffs[NCCL_NUM_PROTOCOLS]; // Local for recv, remote for send
-  void* mhandles[NCCL_NUM_PROTOCOLS];
-  uint64_t* tail;     // Local for recv, remote for send
-  uint64_t* head;     // Local for send, remote for recv
+  char* buffs[NCCL_NUM_PROTOCOLS]; // Local for recv, remote for send  // 实际位置依赖 transport/read-write 模式；NET 使用本地映射
+  void* mhandles[NCCL_NUM_PROTOCOLS]; // 网络设备侧 MR handle（由 getDeviceMr 提供）；区别于 Proxy resources 中的 Host MR handle
+  // ---- (b) 同步计数：提供生产/消费进度与流控；NET 的网络完成仍由 plugin test 检查 ----
+  uint64_t* tail;     // Local for recv, remote for send  // 生产进度；具体读写者依赖 transport/protocol（可能为 GPU 或 Proxy）
+  uint64_t* head;     // Local for send, remote for recv  // 消费进度或可生产信用；具体读写者及发布时机依赖 transport
 
+  // ---- (c) 模式与粒度，以及 direct 用户 buffer 地址交换 ----
   // host side
-  int flags;          // Direct communication / other flags
-  int shared;         // Buffers are shared
-  int stepSize;       // Step size for the SIMPLE buffer
-  void** ptrExchange; // Pointer exchange for direct communication
-  uint64_t* redOpArgExchange; // PreOp scaler exchange for direct pull case
+  int flags;          // Direct communication / other flags  // NCCL_P2P_WRITE / NCCL_P2P_READ / NCCL_DIRECT_NIC 等位
+  int shared;         // Buffers are shared  // 共享 buffer 模式（多 channel 共用一块 proxy buffer）
+  int stepSize;       // Step size for the SIMPLE buffer  // Simple 协议一格大小 = buffSize / NCCL_STEPS
+  void** ptrExchange; // Pointer exchange for direct communication  // 两端交换用户 buffer 地址的槽位
+  uint64_t* redOpArgExchange; // PreOp scaler exchange for direct pull case  // PreMulSum 标量交换槽
 
-  struct ncclConnFifo* connFifo; // Used for GPU - Proxy communication
+  // ---- (d) GPU <-> Proxy 桥：用于 NET，也用于 P2P memcpy 等路径 ----
+  struct ncclConnFifo* connFifo; // Used for GPU - Proxy communication  // NCCL_STEPS 格；NET 发送时 GPU 发布 size，共享 buffer 的 offset 由 Proxy 写、GPU 读
 
-  uint64_t step;      // Keep where we are
-  uint64_t llLastCleaning;
-  ncclNetDeviceHandle_t netDeviceHandle;
+  // ---- (e) 本端进度与杂项 ----
+  uint64_t step;      // Keep where we are  // 本连接当前 step，只在自己这端递增
+  uint64_t llLastCleaning; // LL 清理进度字段
+  ncclNetDeviceHandle_t netDeviceHandle; // 网络插件的设备侧扩展 handle，例如 NCCL_NET_DEVICE_UNPACK
 };
 
 struct ncclProxyConnector {
@@ -231,11 +245,16 @@ struct ncclNvls {
 #define NCCL_MAX_ARITY NCCL_MAX_DIRECT_ARITY
 #endif
 
+// connIndex 取值 0/1：每个方向有两个连接槽；用途由连接建立与 kernel 调用方共同约定，
+// 不能按 Ring/Tree 算法名称固定分配。
 #define NCCL_MAX_CONNS 2
+// 「路线表」叶子：我与某个 peer 在某条 channel 上的全部连接。
+// send 与 recv 分别保存发送、接收连接状态；底层 buffer 是否共享由 transport 决定。
+// 普通 peer 对象存于 sharedRes->peers[channel][topParentRank]，子 comm 通过 rank 映射复用。
 struct ncclChannelPeer {
-  struct ncclConnector send[NCCL_MAX_CONNS];
-  struct ncclConnector recv[NCCL_MAX_CONNS];
-  int refCount;
+  struct ncclConnector send[NCCL_MAX_CONNS]; // 我 -> peer，下标为 connIndex
+  struct ncclConnector recv[NCCL_MAX_CONNS]; // peer -> 我，下标为 connIndex
+  int refCount; // 被多少个（父/子）comm 共享
 };
 
 struct ncclKernelComm;
@@ -412,6 +431,8 @@ struct alignas(16) ncclDevWorkBatch {
   uint64_t offsetBitset;
 };
 
+// ncclChannelPeer 的 GPU 瘦身版：剥掉 vtable / transportResources / proxyConn 等 Host-only 字段，
+// 只保留「契约」ncclConnInfo。kernel 通过 ncclDevChannel::peers[ring.next]->send[0] 这条链找到它。
 struct ncclDevChannelPeer {
   // Stripped version of ncclChannelPeer where we only keep the ncclConnInfo
   // instead of the full ncclConnector.

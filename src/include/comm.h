@@ -153,27 +153,34 @@ struct ncclSharedResources {
   struct ncclGinState ginState;
 };
 
+// 「路线表」：channel 保存拓扑邻居与连接；常规 kernel 启动时，block 经 channelMask 映射到所用 channel。
+// 拓扑视图（ring/tree，由 Topology 流程算出，存 rank 号）与连接视图（peers[]，由 Transport 流程连出）
+// 解耦；Host 连接位于 peers[peer]->send/recv[connIndex].conn，GPU 对应表项直接保存 ncclConnInfo。
+// GPU 侧对应的瘦身版是 ncclDevChannel（device.h）。
 struct ncclChannel {
-  struct ncclChannelPeer** peers;
-  struct ncclDevChannelPeer** devPeers;
+  // ---- (b) 连接视图：本 comm 的指针表，含 nRanks 个普通 peer 及 CollNet/NVLS 额外槽位 ----
+  struct ncclChannelPeer** peers;          // 普通表项指向 sharedRes->peers[id][topParentRanks[r]]，可复用共享连接
+  struct ncclDevChannelPeer** devPeers;    // 同一张表的 GPU 版本（device 指针，供 kernel 用）
   /* devPeer pointer array used for host side access */
-  struct ncclDevChannelPeer** devPeersHostPtr;
-  struct ncclRing ring;
-  int* devRingUserRanks;
-  struct ncclTree tree;
+  struct ncclDevChannelPeer** devPeersHostPtr; // Host 分配的指针表，表项保存 GPU 地址；CPU 可读取表项，不直接解引用 GPU 对象
+  // ---- (a) 拓扑视图：我在这条 channel 上的邻居是谁（rank 号，-1 表示无）----
+  struct ncclRing ring;                    // prev/next + 以我为起点的整环 userRanks[]
+  int* devRingUserRanks;                   // ring.userRanks 的 device 拷贝
+  struct ncclTree tree;                    // up / down[3]
 
-  struct ncclTree collnetChain;
-  struct ncclDirect collnetDirect;
+  struct ncclTree collnetChain;            // CollNet chain 算法的树
+  struct ncclDirect collnetDirect;         // CollNet direct 算法的 heads/up/down
 
-  struct ncclNvls nvls;
+  struct ncclNvls nvls;                    // NVLS（NVSwitch 硬件归约）的 up/down
 
-  int id; // index of this channel
-  uint32_t workFifoProduced; // +1 successor of last used work fifo byte
+  // ---- (c) 运行时 ----
+  int id; // index of this channel                // channel 编号；不一定等于 blockIdx.x
+  uint32_t workFifoProduced; // +1 successor of last used work fifo byte  // host 向 GPU 投递 work 的生产游标
 
   /* comm split sharable resources */
-  struct ncclChannelPeer* collnetPeers;
+  struct ncclChannelPeer* collnetPeers;    // collnet 用的额外 peer 槽，挂在 peers[nRanks]
   struct ncclDevChannelPeer* collnetDevPeers;
-  struct ncclChannelPeer* nvlsPeers;
+  struct ncclChannelPeer* nvlsPeers;       // nvls 用的额外 peer 数组，挂在 peers[nRanks+1 ..]（见 channel.cc initNvlsChannel）
   struct ncclDevChannelPeer* nvlsDevPeers;
 };
 
