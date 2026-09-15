@@ -1,28 +1,34 @@
-## Learned User Preferences
+# NCCL 源码学习仓（分支 `nccl-v2.31.2-learning`）
 
-- 讲解 NCCL/底层网络时采用四段式：技术定义（一句话）→ 大白话类比 → 物理逻辑 → 精简代码佐证；拒绝平铺知识点或大段贴码。
-- 复杂流程优先用 ASCII 图示（调用栈、FIFO/CQ/QP、状态机）；卡住时用类比降低门槛，同时保持专业准确性。
-- 用户具备 RDMA 驱动经验：不要扫盲 QP/CQ/WQE/RoCE 等基础概念；把 NCCL 逻辑直接映射到 Verbs/硬件队列行为。
-- 源码解析聚焦物理机制（对齐、cache line、barrier/atomics、控制面 vs 数据面），避免表层语法翻译。
-- 主流程与抽象概念讲解时按初学者视角做「大脑建模」串讲（例子宜简）；先建心智模型再下钻实现细节。
-- 学习节奏：按知识点单点突破；模块啃完后整理复盘 Markdown 到 `doc/`，便于复习。
-- 啃新模块先「建模」数据结构（字段按功能分组 + 心智模型），再看函数与流程；理解数据结构的优先级高于理解函数。
-- 常要求给大结构体（如 `ncclComm`/`ncclPeerInfo`/`bootstrapState`/`ncclTopoGraph`）按功能分组补中文注释，直接写进源码文件。
-- 核实字段用途时按「编号 + 字段名 + 一句话结论 + 证据 文件:行号」输出，讲清谁写入/谁读取/生命周期，基于代码不泛泛而谈。
-- 学习节点结束后会让 agent 整理当前改动、挑出可提交内容并分批 commit。
-- 配置 Cursor 时改本地配置，不要改远端仓库配置。
-- 回复使用简体中文；技术术语保留英文。
+本仓用于深度学习 NCCL 源码。基线 `v2.31.2-1`（`7b83616d`）。用户具备 RDMA 驱动开发经验，目标是吃透拓扑、IB/RoCE 传输、proxy 调度与无锁并发。
 
-## Learned Workspace Facts
+## 讲解方式
 
-- 本仓库用于深度学习 NCCL 源码，重点包括拓扑图（`src/graph/topo.h`）、IB/RoCE 传输（`src/transport/net_ib.cc`）与 proxy 调度（如 `proxy.cc`）。
-- 核心数据结构集中在 `src/include/comm.h`（`ncclComm`）、`src/include/transport.h`（transport vtable / `ncclPeerInfo`）、`src/bootstrap.cc`（`bootstrapState`）与 `src/include/graph.h`（`ncclTopoGraph`）。
-- Init 心智轴：成员信息 → 物理拓扑 → 算法拓扑 → Channel → 具体连接；对应落地：Bootstrap 会合 → Communicator 建上下文 → Topology 快照并铺 channel → Transport 选 P2P/SHM/NET 连 peer → Proxy setup/connect。
-- 源码学习注释以中文直接写入 `src/` 下头文件与实现，并用中文 commit message（如「补充 X 结构的注释」）单独提交；当前学习分支为 `nccl-v2.31.2-learning`。
-- 教学向规则写在 `.cursorrules`（部分学习分支上）：角色为 RDMA/CUDA 资深工程师视角，并规定上述讲解范式与 `doc/` 沉淀流程。
-- 架构主链以 `doc/architecture/`（L0/L1）与 `doc/l3/` 为准；DeepWiki/按目录划分的索引仅作跳文件用，不作架构心智模型。
-- 学习笔记与串讲文档落在 `doc/`（含 `doc/archify/` 架构图）；入门路径见 `docs/contrib/architecture/learning/zh/`；上游官方文档在 `docs/`。
-- 常用学习相关分支包括 `read_code`、`nccl-v2.31.2-learning`；可能通过 `.worktrees/` 挂载其他 checkout（同分支已被 worktree 占用时需 `cd` 到对应 worktree，不能再 `git checkout` 到主目录）。
-- 本地工具产物已在 `.gitignore` 忽略（`.serena/`、`src/.serena/`、`.remember/`、`.omo/`、`doc/archify/*.visual-check.*`、`*.code-workspace` 等）。
-- 已配置 Serena MCP（本仓 project）与 Archify，用于符号检索与架构图生成。
-- 刷新 clangd 用的 `compile_commands.json` 可用 `bear --output compile_commands.json -- make -j$(nproc)`（通常先 `make clean`）。
+- 四段式：技术定义（一句话）→ 大白话类比 → 物理逻辑 → 精简代码佐证。拒绝平铺知识点、大段贴码。
+- 不扫盲 QP/CQ/WQE/RoCE；把 NCCL 逻辑直接映射到 Verbs / 硬件队列行为。聚焦对齐、cache line、barrier/atomics、控制面 vs 数据面。
+- 复杂流程（调用栈、FIFO/CQ/QP、状态机）优先 ASCII 图。
+- 证据口径：区分「源码事实 / 设计归纳 / 待运行验证」；静态分支不等于运行路径，算法/协议/传输选择必须留给运行证据。
+
+## 学习流程
+
+- 单点突破：一次一个知识点；先「大脑建模」（心智模型），再下钻实现。
+- 新模块先建模数据结构（字段按功能分组），再看函数；数据结构优先于函数。
+- 核实字段用途：`编号 + 字段名 + 一句话结论 + 证据 文件:行号`，讲清谁写/谁读/生命周期。
+- 动手前先 `git log --oneline -- <文件>` 看该结构是否已注释过，避免重复建模。
+
+## 沉淀与提交
+
+- 结构体注释直接写进 `src/` 源码，中文，沿用 `comm.h` 风格：`// ============ 功能分组 ============`、`// ---- (a) 子视图 ----`；不改代码语义。
+- 模块啃完后复盘 Markdown 到 `doc/`；架构图用 Archify 落 `doc/archify/`。
+- 学习节点结束：整理改动、挑可提交内容、分批提交；commit message 中文，如「补充 X 结构的注释」。
+- 配置 Cursor 只改本地（`~/.cursor/`），不改远端仓库配置。
+
+## 仓库地图
+
+- 架构主链入口：`doc/architecture/nccl-architecture-index.md`（L0/L1）→ `doc/archify/nccl-l2-design.md`（L2）→ `doc/l3/nccl-l3-design-index.md`（L3）。DeepWiki/目录索引只作跳文件用。
+- 核心结构：`src/include/comm.h`（`ncclComm`）、`src/include/transport.h`（vtable / `ncclPeerInfo`）、`src/bootstrap.cc`（`bootstrapState`）、`src/include/graph.h`（`ncclTopoGraph`）、`src/include/proxy.h`。
+- 重点源码：`src/graph/topo.h`、`src/transport/net_ib/`（v2.31 已拆目录：`init.cc` 设备发现、`connect.cc` QP 建链、`p2p.cc` 数据面、`reg.cc` MR 注册、`gdr.cc`）、`src/proxy.cc`。
+- Init 心智轴：成员信息 → 物理拓扑 → 算法拓扑 → Channel → 连接；落地 Bootstrap → Communicator → Topology/channel → Transport(P2P/SHM/NET) → Proxy setup/connect。
+- 入门路径 `docs/contrib/architecture/learning/zh/`；上游官方文档 `docs/`；分支 `read_code` 上有 `.cursorrules`（同一讲解范式的完整版）。
+- 同分支被 worktree 占用时 `cd` 到对应 worktree，勿在主目录强行 `git checkout`。
+- 符号检索用 Serena MCP。刷新 clangd：`make clean && bear --output compile_commands.json -- make -j$(nproc)`。

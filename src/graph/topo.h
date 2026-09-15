@@ -77,22 +77,30 @@ extern const char* topoLinkTypeStr[];
 extern int64_t ncclParamPxnC2c();
 // 节点
 struct ncclTopoNode;
-// 边
+// 边：一条「有向」物理出边，存在源节点的 links[] 里。
+// - 有向：ncclTopoConnectNodes(a, b) 只加 a→b，反向需再调一次（建图代码总是成对调用）。
+// - 可聚合：同一对节点间同 type 的边只存一条，bw 累加（XML <nvlink count=N> → 一条 bw = N × 单链带宽）。
+// - bw 来自 topo.h 顶部常量表（查表值，不是测量值），是后续路径/搜索的统一度量单位。
 struct ncclTopoLink {
-  int type;
-  float bw;
-  struct ncclTopoNode* remNode;
+  int type;                     // LINK_*（LOC / NVL / C2C / PCI / SYS / NET），与 PATH_* 数值尽量对齐
+  float bw;                     // GB/s，聚合后的总带宽
+  struct ncclTopoNode* remNode; // 对端节点
 };
 // Allows for up to 32 NICs per node on GB200-NVL72
 #define NCCL_TOPO_MAX_LINKS 576
 #define NCCL_TOPO_MAX_HOPS (NCCL_TOPO_MAX_NODES * NCCL_TOPO_NODE_TYPES)
 
+// 路径：从某节点出发到某目标的一条完整路线（ncclTopoNode::paths[t][i] 的元素）。
+// 由 paths.cc · ncclTopoSetPaths 以目标为源做 BFS 反向填出：list[0] 是本节点自己的出边，
+// 依次到目标。更新优先级：type 更小 > 同 type 下 bw 更大 > 同 type 同 bw 下 count 更少。
+// 之后 ncclTopoComputePaths 还会按策略覆盖（P2P 禁用 / 无 GDR 绕 CPU、PXN、不可达置 PATH_NET），
+// 所以这里的 type 已经是「NCCL 允许怎么走」，Transport 选型直接查它。
 struct ncclTopoLinkList {
-  struct ncclTopoLink** list;
-  int count;     // Number of links stored in list. 几段路=> 几跳
+  struct ncclTopoLink** list; // 指向沿途各节点 links[] 里的真实边，不拷贝
+  int count;     // Number of links stored in list. 跳数
   int capacity;  // Number of entries allocated for list.
-  float bw; // 全程最窄那段限速（瓶颈带宽）
-  int type; // 路线等级（NVLink 直连 / 过 PCIe / 过 CPU / PXN…）
+  float bw; // 全程瓶颈带宽 = 沿途各边 bw 取 min
+  int type; // 路线等级 PATH_*（沿途各跳取 max，PCI→PCI 记 PXB、经 CPU 记 PHB、经 DEV 中转记 NVB）
 };
 
 #define NCCL_TOPO_UNDEF (-1)
@@ -119,14 +127,22 @@ struct ncclTopoLinkList {
 #define NCCL_TOPO_MLOPART_BUSID(busId, mloPart) \
   ((mloPart) != NCCL_TOPO_UNDEF ? ((busId) | NCCL_TOPO_MLOPART(mloPart)) : (busId))
 
+// 拓扑图节点。字段分三组：
+//   [身份]   type / id / union{...}      建图时由 XML 填入，之后只读
+//   [Layer-0] links[] / nlinks           物理出边邻接表，建图时填
+//   [Layer-1] paths[t][]                 到「类型 t 的每个节点」的预计算路线，ncclTopoComputePaths 填，
+//                                        Trim 删节点后必须 RemovePaths 再重算（i 是桶内下标，会挪动）
+//   [搜索]   used                        ncclTopoCompute 回溯时的访问标记
+// 注意 GPU 与 DEV 是两个节点：GPU 是 rank 视角的逻辑节点（带 gpu.rank），DEV 是物理芯片，
+// 二者用 LINK_LOC 互连，NVLink / C2C 挂在 DEV 上（v2.31 为 MLOPart 分区引入）。
 struct ncclTopoNode {
-  int type;
-  int64_t id;
+  int type;   // GPU / PCI / NVS / CPU / NIC / NET / GIN / RMA / DEV / CXB
+  int64_t id; // NCCL_TOPO_ID(systemId, localId)：高 8 bit 区分主机，低 56 bit 为 busId / dev 号
   // Type specific data
   union {
     struct {
       int dev; // NVML dev number
-      int rank;
+      int rank;                    // 该 GPU 对应的 comm rank；paths/搜索结果里的 rank 号都由此而来
       int cudaCompCap;
       int gdrSupport;
       int mloPart; // MLOPart partition index, or NCCL_TOPO_UNDEF if not MLOPart
@@ -182,6 +198,8 @@ struct ncclTopoNode {
   uint64_t used;
 };
 
+// 某一类型节点的「桶」。paths[t][i] 与 graph->intra 里的 GPU 下标都指这里的 nodes[i]，
+// 因此 ncclTopoRemoveNode 会 memmove 挪动后续元素——这正是 Trim 后必须重算 paths 的原因。
 struct ncclTopoNodeSet {
   int count;
   struct ncclTopoNode nodes[NCCL_TOPO_MAX_NODES];

@@ -274,16 +274,20 @@ ncclResult_t ncclTopoCompute(struct ncclTopoSystem* system, struct ncclTopoGraph
 ncclResult_t ncclTopoPrintGraph(struct ncclTopoSystem* system, struct ncclTopoGraph* graph);
 ncclResult_t ncclTopoDumpGraphs(struct ncclTopoSystem* system, int ngraphs, struct ncclTopoGraph** graphs);
 
+// 每个 rank 在 AllGather3 里公布的「本机片段接口」：ncclTopoPreset 只用本机 graph->intra 就能填，
+// bootstrapAllGather 交换后，ncclTopoPostset 用各机代表 rank（firstRanks[n] = ringRecv[0]）的
+// ringRecv/ringSend 把片段首尾相接成全局 ring，再写回 comm->channels[c].ring.prev/next。
+// 所有数组按 channel 下标；只前 comm->nChannels 项有效。
 struct ncclTopoRanks {
-  int crossNicRing;
-  int ringRecv[MAXCHANNELS];
-  int ringSend[MAXCHANNELS];
-  int ringPrev[MAXCHANNELS];
-  int ringNext[MAXCHANNELS];
-  int treeToParent[MAXCHANNELS];
-  int treeToChild0[MAXCHANNELS];
-  int treeToChild1[MAXCHANNELS];
-  int nvlsHeads[MAXCHANNELS];
+  int crossNicRing;              // ring 图是否用了 crossNic=2；Postset 据此在奇数节点交换奇偶 channel 避免跨 rail
+  int ringRecv[MAXCHANNELS];     // 本机片段的首 rank = intra[c][0]，也是全局 ring 进入本机的入口
+  int ringSend[MAXCHANNELS];     // 本机片段的尾 rank = intra[c][ngpus-1]，全局 ring 离开本机的出口
+  int ringPrev[MAXCHANNELS];     // 我在片段内的前邻；我是片段头时为 -1，由 Postset 填上一台机器的 ringSend
+  int ringNext[MAXCHANNELS];     // 我在片段内的后邻；我是片段尾时为 -1，由 Postset 填下一台机器的 ringRecv
+  int treeToParent[MAXCHANNELS]; // 本机负责与父节点收发的 rank（intra[c][0]）
+  int treeToChild0[MAXCHANNELS]; // 本机负责与子节点 0 收发的 rank；TREE 模式与 parent 同一 GPU，否则 intra[c][1]
+  int treeToChild1[MAXCHANNELS]; // 本机负责与子节点 1 收发的 rank；仅 SPLIT_TREE 用 intra[c][1]
+  int nvlsHeads[MAXCHANNELS];    // NVLS 各 channel 的 head rank（去重后）
   int nvlsHeadNum;
 };
 
