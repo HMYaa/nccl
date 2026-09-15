@@ -57,6 +57,8 @@ struct ncclIbMrCache {
 extern int ncclNMergedIbDevs;
 #define NCCL_IB_MAX_DEVS_PER_NIC NCCL_NET_MAX_DEVS_PER_NIC
 #define MAX_MERGED_DEV_NAME (MAXNAMESIZE * NCCL_IB_MAX_DEVS_PER_NIC) + NCCL_IB_MAX_DEVS_PER_NIC
+// 「虚拟 NIC」：ncclNet 对外暴露的 dev 号指的是它，不是物理口。默认每个物理口一个；
+// 拓扑层（topo.cc · ncclTopoMakeVNics → makeVDevice）可把多个物理口合并为一个，之后一条连接的 QP 条带到所有口上。
 struct alignas(64) ncclIbMergedDev {
   ncclNetVDeviceProps_t vProps;
   int speed;
@@ -81,6 +83,9 @@ struct ncclIbGidInfo {
   int32_t localGidIndex;
 };
 
+// 一个物理 HCA 端口（ncclIbInitDevices 枚举，进程内全局 ncclIbDevs[]）。PD 在此按设备共享（pdRefs 计数），
+// MR 缓存也挂在这里（按页对齐 + 引用计数，跨 comm 复用）；每个设备一条 ncclIbAsyncThread 收 async event
+// 并把致命错误累计到 stats.fatalErrorCount，数据面每次 isend/irecv/test 前检查。
 extern int ncclNIbDevs;
 struct alignas(64) ncclIbDev {
   std::mutex mutex;
@@ -184,6 +189,16 @@ extern const char* ncclIbReqTypeStr[];
 // Maximal number of QPs a communicator can have for data transfers
 #define NCCL_IB_MAX_QPS 128
 
+// ============ 数据面协议总览（读结构体前先看这段）============
+// 一条 NET 连接 = 1 条 TCP（只建链）+ nqps 个 RC QP（数据）+ 两张「对端可 RDMA WRITE 直写」的 host 表：
+//   sender  侧 ncclIbSendComm::ctsFifo          ← receiver 在 irecv 时写 CTS（addr/rkeys/tag/idx）
+//   receiver 侧 ncclIbRecvComm::cmplsRecords     ← sender 在多收（nreqs>1）时写 sizes[]
+// 每张表在对端都有一份同布局的「影子」（remCtsFifo.elems / remCmplsRecords.elems），本地注册 MR 取 lkey
+// 作 gather 源，对端表的 addr+rkey 在建链 metadata 里交换。数据本身由 sender RDMA WRITE 直写 CTS 给的地址，
+// 末尾一条 RDMA WRITE WITH IMM 触发 receiver 预投的空 recv WR 产生 CQE。没有 SEND/RECV 语义的数据报文。
+// 槽位：两侧各自的 base.fifoHead 单调递增，slot = fifoHead % NET_IB_MAX_REQUESTS(256)，请求 id = fifoHead。
+
+// receiver 侧每槽一份的「完成记录」，被 sender RDMA WRITE 直写（sizes）或 receiver 本地填（completions）。
 // Tracks data transfers between sender and receiver. A multi-recv/send uses a
 // single record.
 struct ncclIbRequestCompletionRecord {
@@ -202,10 +217,17 @@ struct ncclIbRequestCompletionRecord {
   bool completions[NCCL_IB_MAX_QPS];
 };
 
+// 一次 isend / irecv / iflush 的 host 侧句柄（即 ncclNet 返回给 Proxy 的 request，存在 sub->requests[]）。
+// 生命周期：ncclIbGetRequest 从 base.reqs[] 找 type==UNUSED 的槽 → 提交时按「每 QP 一个 signaled CQE」预置
+// events[dev] → ncclIbTest 逐设备 poll_cq，按 wr_id 反查到本请求后 events[dev]-- → 全零即完成，FreeRequest 置回 UNUSED。
+// 反查键：sender 侧 wr_id 低 8 bit = slot（multi-send 每个请求占 8 bit）；receiver 侧 BY_INDEX 用 wr_id = slot，
+// BY_ID 用 imm_data = id % 2^32；flush 用 wr_id = reqIndex + NCCL_IB_FLUSH_REQ_WR_ID_OFFSET。
 struct ncclIbRequest {
-  struct ncclIbNetCommBase* base;
-  int type;
+  // ---- (a) 身份 ----
+  struct ncclIbNetCommBase* base; // 所属 comm（send 或 recv），从中取 vProps / qps / reqs
+  int type;                       // NCCL_NET_IB_REQ_*：UNUSED 即空闲槽
   struct ncclSocket* sock;
+  // ---- (b) 完成计数：按物理设备维度，不是按 QP ----
   // Array of counters. Each element in the array is populated with the expected
   // number of completion events that the request is expecting to be generated
   // on the device corresponding to the index of the element. After the request
@@ -221,13 +243,15 @@ struct ncclIbRequest {
 #ifdef NCCL_ENABLE_NET_PROFILING
   struct ncclProfilerInfo pInfo[NCCL_NET_IB_MAX_RECVS];
 #endif
-  uint64_t id;
-  int nreqs;
+  // ---- (c) 槽位与多收 ----
+  uint64_t id;   // = 提交时的 base.fifoHead；slot = id % NET_IB_MAX_REQUESTS
+  int nreqs;     // 同一槽的 multi-recv 路数（irecv 的 n，isend 从 CTS 的 nreqs 读回），1..NCCL_NET_IB_MAX_RECVS
+  // ---- (d) 方向私有 ----
   union {
     struct {
-      int size;
+      int size;      // min(用户 size, CTS.size)
       void* data;
-      uint32_t lkeys[NCCL_IB_MAX_DEVS_PER_NIC];
+      uint32_t lkeys[NCCL_IB_MAX_DEVS_PER_NIC]; // 每物理设备一个 lkey（regMr 每口注册一次），按 QP 所在设备选
       // Tracks whether data was transmitted on a QP for this request.
       bool sentData[NCCL_IB_MAX_QPS];
       // Per-device LB weights used for chunk computation.
@@ -249,8 +273,10 @@ struct ncclIbRequest {
   void* rmaProxyCtx;
 };
 
+// comm 在「一个物理设备」上的 Verbs 资源：PD 按设备全局共享（ncclIbDev::pd + pdRefs），CQ 按 comm×设备私有，
+// 该设备上的所有 QP（数据 / CTS / flush）共用这一个 CQ，ncclIbTest 只 poll 这里。
 struct ncclIbNetCommDevBase {
-  int ibDevN;
+  int ibDevN;        // ncclIbDevs[] 下标
   struct ibv_pd* pd;
   struct ibv_cq* cq;
   uint64_t pad[2];
@@ -265,13 +291,16 @@ static inline void ncclIbGidInfoSnapshot(struct ncclIbNetCommDevBase* base, stru
   base->gidInfo = ibDev->gidInfo;
 }
 
+// 一条 CTS（Clear-To-Send）：receiver 在 irecv 时填好，RDMA WRITE 到 sender 的 ctsFifo[slot][r]。
+// 64 B、32 B 对齐（见下方 static_assert），idx 放最后当 valid flag：sender 先读 idx == fifoHead+1，
+// fence，再读 addr/rkeys/tag。「一条不被拆写」是对 Relaxed Ordering 下 PCIe 写事务的假设。
 struct ncclIbSendFifo {
-  uint64_t addr;
-  uint64_t size;
-  uint32_t rkeys[NCCL_IB_MAX_DEVS_PER_NIC];
-  uint32_t nreqs;
-  uint32_t tag;
-  uint64_t idx;
+  uint64_t addr;                            // receiver 用户 buffer 地址（数据 WRITE 的 remote_addr）
+  uint64_t size;                            // receiver 期望的最大长度，sender 取 min
+  uint32_t rkeys[NCCL_IB_MAX_DEVS_PER_NIC]; // receiver 每物理设备一个 rkey，sender 按 QP 的 remDevIdx 选
+  uint32_t nreqs;                           // 本槽 multi-recv 路数
+  uint32_t tag;                             // 对号用；net.cc 传 tpRank / tpRemoteRank
+  uint64_t idx;                             // = receiver fifoHead+1，有效标志兼序号
 };
 
 struct ncclIbQpInitAttr {
@@ -302,10 +331,13 @@ struct ncclIbQpRtsAttr {
   int retryCnt;
 };
 
+// 一个 RC QP 及其「可重放」的建链参数：Init/Rtr/Rts 三组 attr 建链时填好、故障恢复时原样重灌。
+// 数据 QP 按 qpIndex % ndevs 条带到 merged 设备上；sender 侧 QP maxRecvWr=0（不收报文），
+// receiver 侧 QP 的 SQ 只发 CTS、RQ 预投空 WR 接 IMM。
 struct ncclIbQp {
   struct ibv_qp* qp;
   // The index of the device on which this QP was created on.
-  int devIndex;
+  int devIndex;  // 本地 merged 设备下标（vProps.devs[]）
 
   // The ECE (enhanced connection establishment) used on this QP.
   // Note: This is the reduced ECE exchanged between the sender and receiver.
@@ -320,7 +352,7 @@ struct ncclIbQp {
 
   // The index of the device on the remote side to which this QP is connected
   // to.
-  int remDevIdx;
+  int remDevIdx; // 对端 merged 设备下标；选 CTS.rkeys[remDevIdx] / remDevs[remDevIdx].rkey 用
   struct ncclIbWqeLatMon latMon;
 };
 
@@ -361,26 +393,30 @@ struct ncclIbMrHandle {
 // Forward declaration
 struct ncclIbResiliency;
 
+// send / recv comm 的公共头（两者首字段，可互相 cast）。ncclIbGetNetCommDevBase 按 isSend 取各自 devs[i].base。
 struct alignas(32) ncclIbNetCommBase {
-  ncclNetVDeviceProps_t vProps;
+  // ---- (a) 本地设备视图 ----
+  ncclNetVDeviceProps_t vProps; // 本 merged 设备包含哪些物理口（devs[ndevs]）
   bool isSend;
-  struct ncclIbRequest reqs[NET_IB_MAX_REQUESTS];
-  struct ncclIbQp qps[NCCL_IB_MAX_QPS];
+  // ---- (b) 请求池与 QP 池 ----
+  struct ncclIbRequest reqs[NET_IB_MAX_REQUESTS]; // 256 = 32 在途请求 × 8 路 multi-recv
+  struct ncclIbQp qps[NCCL_IB_MAX_QPS];           // qps[qpIndex]，qpIndex % ndevs 即所在设备
   // Array of pointers to the "actual" QPs that are used for data transfers.
   // The pointers point to QPs in the ncclIbNetCommBase::qps[] array.
-  struct ncclIbQp* activeQps[NCCL_IB_MAX_QPS];
-  uint64_t fifoHead;
-  int nqps;
-  int splitDataOnQps;
-  struct ncclSocket sock;
-  int ready;
+  struct ncclIbQp* activeQps[NCCL_IB_MAX_QPS];    // 默认恒等映射；resiliency 故障切换时改指向
+  uint64_t fifoHead;   // 本侧单调递增的槽游标：irecv / isend 成功各 ++；slot = fifoHead % 256，req->id = fifoHead
+  int nqps;            // = max(local ndevs, remote ndevs) × NCCL_IB_QPS_PER_CONNECTION，两侧一致
+  int splitDataOnQps;  // NCCL_IB_SPLIT_DATA_ON_QPS：1 则每请求跨所有 nqps 切片，0 则只用 nDataQps 个
+  // ---- (c) 建链控制面 ----
+  struct ncclSocket sock; // 建链 TCP；连上后只在 close 时用
+  int ready;              // connect 侧 RTS 后置 1 并发给 accept 侧
   // Track necessary remDevInfo here
-  int nRemDevs;
+  int nRemDevs;           // 对端 merged 设备的物理口数，可与本地 ndevs 不同
   bool remOooRq;
   bool localOooRq;
-  int recvMatchingScheme;
-  int nDataQps;
-  struct ncclIbDevInfo remDevs[NCCL_IB_MAX_DEVS_PER_NIC];
+  int recvMatchingScheme; // BY_INDEX（默认，wr_id=slot）/ BY_ID（imm=id；OOO RQ 或端口 failover 时强制）
+  int nDataQps;           // = max(local ndevs, remote ndevs)：splitDataOnQps=0 时每请求用的 QP 数
+  struct ncclIbDevInfo remDevs[NCCL_IB_MAX_DEVS_PER_NIC]; // 对端每物理口的 lid/gid/mtu/rkey，metadata 里来
   // statistics about the comm
   struct ncclIbStats stats;
   struct ncclIbResiliency* resiliency;
@@ -507,8 +543,11 @@ static inline ncclResult_t ncclIbPostRecvWorkRequest(struct ibv_qp* qp, struct i
   return ncclSuccess;
 }
 
+// sender 侧 comm（ncclNet 的 sendComm）。数据面职责：等 CTS → 按权重切片 → 每 QP 一条 RDMA WRITE +
+// 末尾一条 RDMA WRITE WITH IMM（唯一 signaled，所以每 QP 每请求恰好 1 个 CQE）。
 struct ncclIbSendComm {
   struct ncclIbNetCommBase base;
+  // ---- (a) 被对端直写的表 + 预分配的 WR/SGE ----
   // Start with CTS FIFO and ibv structs as they have alignment restrictions
 
   // CTS FIFO from which the sender reads the Clear-to-Send (CTS) messages that
@@ -516,11 +555,13 @@ struct ncclIbSendComm {
   // issuing a (multi-)receive request). Each row in the 2D array corresponds
   // to a single CTS message but can describe multiple recv-requests issued
   // on the receiver side.
-  struct ncclIbSendFifo ctsFifo[NET_IB_MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
-  struct ibv_sge sges[NCCL_NET_IB_MAX_RECVS];
-  struct ibv_send_wr wrs[NCCL_NET_IB_MAX_RECVS + 1];
+  struct ncclIbSendFifo ctsFifo[NET_IB_MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS]; // [slot][r]，receiver RDMA WRITE 直写
+  struct ibv_sge sges[NCCL_NET_IB_MAX_RECVS];        // 每路一条 SGE，MultiSend 逐 QP 改 addr/length
+  struct ibv_send_wr wrs[NCCL_NET_IB_MAX_RECVS + 1]; // nreqs 条 WRITE + 1 条 WRITE_WITH_IMM，链表一次 post_send
+  // ---- (b) 每物理口的 MR / CQ ----
   // Each dev correlates to a mergedIbDev
   struct ncclIbSendCommDev devs[NCCL_IB_MAX_DEVS_PER_NIC];
+  // ---- (c) 槽位 → 请求 的反查表（ncclIbTest 用 wr_id 低 8 bit 查这里）----
   // Array of pointers to store the send requests for faster access. The
   // pointers are pointing into requests stored in ncclIbNetCommBase::reqs[]
   // array. The requests are inserted to this array based on the "slot" they
@@ -528,9 +569,9 @@ struct ncclIbSendComm {
   struct ncclIbRequest* sendReqs[NET_IB_MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
 
   // Counter per "slot" on how many send request were called for a multi-recv
-  int sendReqsCnt[NET_IB_MAX_REQUESTS];
-  struct ncclIbRemCompletionsRecords remCmplsRecords;
-  int ar; // Use adaptive routing when all merged devices have it enabled
+  int sendReqsCnt[NET_IB_MAX_REQUESTS]; // isend 到达 ++，等于 nreqs 才真正 post；完成 --，归零才清槽复用
+  struct ncclIbRemCompletionsRecords remCmplsRecords; // receiver cmplsRecords 的影子 + 远端 addr/rkeys
+  int ar; // Use adaptive routing when all merged devices have it enabled；AR 且 size > NCCL_IB_AR_THRESHOLD 时数据与 IMM 拆两条 WR
   uint64_t putSignalScratchpad;
 
   struct ncclIbRemoteSpeedBuf remoteSpeedBuf;
@@ -547,9 +588,11 @@ static_assert((sizeof(struct ncclIbSendFifo) % 32) == 0, "ncclIbSendFifo element
 static_assert((offsetof(struct ncclIbSendComm, sges) % 32) == 0, "sges must be 32-byte aligned");
 static_assert((offsetof(struct ncclIbSendComm, wrs) % 32) == 0, "wrs must be 32-byte aligned");
 
+// GDR flush 资源：一个「连到自己」的 loopback RC QP，对刚收到的 GPU buffer 发 1 字节 RDMA READ 到 host，
+// READ 的 CQE 到达即保证 NIC 先前对同一 PCIe 目标的写已落地、对 GPU 可见。首次 iflush 才懒创建。
 struct ncclIbGpuFlush {
-  struct ibv_mr* hostMr;
-  struct ibv_sge sge;
+  struct ibv_mr* hostMr; // 指向 ncclIbRecvComm::gpuFlushHostMem 的 4 B host MR（READ 的落点）
+  struct ibv_sge sge;    // length = 1
   struct ncclIbQp qp;
 };
 
@@ -592,29 +635,36 @@ struct alignas(16) ncclIbRecvCommDev {
 #define NCCL_IB_RECV_WR_ID_DUMMY UINT64_MAX
 #define NCCL_IB_SPEED_UPDATE_WR_ID (UINT64_MAX - 1)
 
+// receiver 侧 comm（ncclNet 的 recvComm）。数据面职责：irecv 时每 QP 预投一条空 recv WR（接 IMM）+
+// 用 RDMA WRITE 把 CTS 写进 sender 的 ctsFifo；数据到达由 IMM 的 CQE 得知；GDR 时再 iflush。
 struct ncclIbRecvComm {
   struct ncclIbNetCommBase base;
+  // ---- (a) 每物理口的 MR / CQ / flush QP ----
   struct ncclIbRecvCommDev devs[NCCL_IB_MAX_DEVS_PER_NIC];
+  // ---- (b) 槽位 → 请求 的反查表（BY_INDEX 用 wr_id=slot，BY_ID 用 imm % 256 查这里）----
   // Array of pointers to store the recv requests to allow faster access. The
   // pointers are pointing into requests stored in ncclIbNetCommBase::reqs[]
   // array. The requests are inserted to this array using a hash (modulo) on
   // their ID.
   struct ncclIbRequest* recvReqs[NET_IB_MAX_REQUESTS];
+  // ---- (c) 与 sender 互写的两张表 ----
   // Structure to hold all the related structures regarding the CTS FIFO
   // structure.
-  struct ncclIbRemCtsFifo remCtsFifo;
+  struct ncclIbRemCtsFifo remCtsFifo; // sender ctsFifo 的影子（本地填好后作 RDMA WRITE 的 gather 源）+ 远端 addr/rkeys
   // Structure to hold all the completion records of all the outstanding
   // receive requests on the receiver side.
-  struct ncclIbRequestCompletionRecord cmplsRecords[NET_IB_MAX_REQUESTS];
-  int gpuFlushHostMem;
-  int flushEnabled;
-  int flushQpSl;
+  struct ncclIbRequestCompletionRecord cmplsRecords[NET_IB_MAX_REQUESTS]; // [slot]，sender 多收时直写 sizes[]
+  // ---- (d) GDR flush ----
+  int gpuFlushHostMem;   // flush READ 的 host 落点
+  int flushEnabled;      // nv_peermem 或 DMA-BUF 可用且未 NCCL_GDR_FLUSH_DISABLE
+  int flushQpSl;         // loopback QP 的 sl/tc 沿用 connect 侧 metadata
   int flushQpTc;
-  bool flushQpsCreated;
-  bool prepostReceiveWorkRequests;
+  bool flushQpsCreated;  // 懒创建标志
+  // ---- (e) recv WR 投递策略 ----
+  bool prepostReceiveWorkRequests; // 默认 false：irecv 时逐 QP 投一条；OOO RQ / resiliency 时强制预投满并在 CQE 后补投
   // To avoid allocation and memset on the data-path a single structure is used
   // and only the wr_id is updated before posting a receive work request.
-  struct ibv_recv_wr ibRecvWorkRequest;
+  struct ibv_recv_wr ibRecvWorkRequest; // num_sge = 0 的空 WR：只为接 WRITE_WITH_IMM 的 CQE
 
   uint64_t remSpeedBufAddr;
   struct ncclIbRemoteSpeedBuf speedUpdateBuf;
