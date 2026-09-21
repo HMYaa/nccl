@@ -411,6 +411,17 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
 
 // Called once per ncclGroup to organize the user submitted tasks in
 // comm->planner so that they can be peeled off into plans.
+/*1. 分桶 → 按 (func, op, datatype)，不是按算法。
+  2. 拿算法前 → 同桶里差不多大的（<4×）先合着估一次，再 ncclGetAlgoInfo，再写回每条 task。
+  3. 串总队 → 按调度约束四筐拼接：先普通（非 CollNet），同层里再非 NVLS → NVLS，然后才是 CollNet 那侧。口语说「普通 → 不普通」可以，本质是 CollNet ×
+     NVLS，不是 Ring/Tree 各一串。
+
+  签名分桶 →（4×合批）选型写回 → 按 CollNet/NVLS 拼成 collTaskQueue
+
+  再往后还有第二遍（要不要建链等） */
+
+// ncclPrepareTasks = 分组 → 选型 → 写回 → 排成待排产队列（顺带可能标记要建链）。
+
 ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool* needConnect, ncclSimInfo_t* simInfo) {
   struct ncclKernelPlanner* planner = &comm->planner;
   planner->persistent = ncclCudaGraphValid(planner->capturingGraph);
@@ -503,6 +514,11 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
       agg.devFuncId = ncclDevFuncId(agg.func, agg.opDev.op, agg.datatype, agg.algorithm, agg.protocol);
 
       int isCollnet = 0, isNvls = 0;
+      // collBins[isCollnet][isNvls]   // 最多 4 条队列
+      // [0][0]  普通（Ring/Tree 等）     ← 典型 AllReduce 在这
+      // [0][1]  只要 NVLS
+      // [1][0]  只要 CollNet
+      // [1][1]  CollNet + NVLS
       switch (agg.algorithm) {
       case NCCL_ALGO_NVLS:
       case NCCL_ALGO_NVLS_TREE:
