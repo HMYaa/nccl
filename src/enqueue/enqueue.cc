@@ -454,7 +454,7 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
   // Tasks are assembled by (fn,op,ty) size ascending.
   struct ncclTaskColl* tasksByFnOpTy[ncclNumFuncs * ncclNumDevRedOps * ncclNumTypes];
   memset(tasksByFnOpTy, 0, sizeof(tasksByFnOpTy));
-  int fnOpTyIndices[ncclNumFuncs * ncclNumDevRedOps * ncclNumTypes];
+  int fnOpTyIndices[ncclNumFuncs * ncclNumDevRedOps * ncclNumTypes]; // tasksByFnOpTy[index] 就是该 (fn, op, ty) 桶的链表头指针。
   int fnOpTyCount = 0;
 
   // Skip symmetric kernels for cross-clique
@@ -463,14 +463,14 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
   }
 
   // Walk the size sorted tasks, binning them by (fn,op,ty).
-  while (task != nullptr) {
+  while (task != nullptr) { // 桶头 → A(1 MiB) → B(2 MiB) → C(3 MiB) → D(8 MiB)
     struct ncclTaskColl* next = task->next;
     int index = ((int)task->func * ncclNumDevRedOps + (int)task->opDev.op) * ncclNumTypes + (int)task->datatype;
     // Add to set of (fn,op,ty) indices on first occurrence
     if (tasksByFnOpTy[index] == nullptr) fnOpTyIndices[fnOpTyCount++] = index;
-    // Add to LIFO for this (fn,op,ty)
-    task->next = tasksByFnOpTy[index];
-    tasksByFnOpTy[index] = task;
+    // Add to LIFO for this (fn,op,ty) ， 头插，配合，sorter 是从大大小的排序，大小依次是 8 → 4 → 1。头插后实现，从大到小的排序。
+    task->next = tasksByFnOpTy[index]; // 新节点指向原桶头
+    tasksByFnOpTy[index] = task;       // 桶头改成新节点
     // Next task
     task = next;
   }

@@ -7,6 +7,7 @@
 - 四段式：技术定义（一句话）→ 大白话类比 → 物理逻辑 → 精简代码佐证。拒绝平铺知识点、大段贴码。
 - 不扫盲 QP/CQ/WQE/RoCE；把 NCCL 逻辑直接映射到 Verbs / 硬件队列行为。聚焦对齐、cache line、barrier/atomics、控制面 vs 数据面。
 - 复杂流程（调用栈、FIFO/CQ/QP、状态机）优先 ASCII 图。
+- 用户说「继续」时给规划 + 分层串讲，每层讲完停下等确认；不出自测题/quiz。
 - 证据口径：区分「源码事实 / 设计归纳 / 待运行验证」；静态分支不等于运行路径，算法/协议/传输选择必须留给运行证据。
 
 ## 学习流程
@@ -19,7 +20,8 @@
 ## 沉淀与提交
 
 - 结构体注释直接写进 `src/` 源码，中文，沿用 `comm.h` 风格：`// ============ 功能分组 ============`、`// ---- (a) 子视图 ----`；不改代码语义。
-- 模块啃完后复盘 Markdown 到 `doc/`；架构图用 Archify 落 `doc/archify/`。
+- 学习笔记在独立仓 `/home/yangxw/yxw/playbook/notes/ccl/summer/`（`00`–`07` + `90-pain-points`），按 README「写作约定」的 02 模板写：正文 150–220 行、每小节 ≤1 个代码块 ≤15 行、引用写 `文件 · 符号名`；细节过「粒度闸门」才进正文，否则放 `deep/`；新篇写完更新 README 阅读顺序表。笔记与 nccl 仓源码注释分开提交。
+- 架构图用 Archify 落 `doc/archify/`。
 - 学习节点结束：整理改动、挑可提交内容、分批提交；commit message 中文，如「补充 X 结构的注释」。
 - 配置 Cursor 只改本地（`~/.cursor/`），不改远端仓库配置。
 
@@ -32,3 +34,12 @@
 - 入门路径 `docs/contrib/architecture/learning/zh/`；上游官方文档 `docs/`；分支 `read_code` 上有 `.cursorrules`（同一讲解范式的完整版）。
 - 同分支被 worktree 占用时 `cd` 到对应 worktree，勿在主目录强行 `git checkout`。
 - 符号检索用 Serena MCP。刷新 clangd：`make clean && bear --output compile_commands.json -- make -j$(nproc)`。
+
+## Learned User Preferences
+
+- 串讲核心数据结构时沿用「路线表 + 契约 + 快递单」心智模型（Channel/Connector → ConnInfo → ProxyArgs），函数视为在填这三张表。
+- 读代码按用户点名的单点（符号/函数）一步步下钻，先对齐理解再展开下一段。
+
+## Learned Workspace Facts
+
+- 本仓用 Makefile 构建，无可用 CMakeLists；勿用 CMake Tools 配工程，clangd 依赖 `bear` + `make` 生成 `compile_commands.json`。
