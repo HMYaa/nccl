@@ -153,6 +153,7 @@ NCCL_PARAM(P2pEpochEnable, "P2P_EPOCH_ENABLE", 1);
 void ncclAddWorkBatchToPlan(struct ncclComm* comm, struct ncclKernelPlan* plan, int channelId,
                             enum ncclDevWorkType workType, int devFuncId, uint32_t workOffset, int p2pEpoch,
                             int p2pRound, bool newBatch) {
+  // Batch = 索引/调度目录；DevWorkColl = 算法货单。 Kernel 按 Batch 找到 Coll，再 ncclCollCbdPart 算本 CTA 负责哪一段。
   size_t workSize = ncclDevWorkSize(workType);
   ncclKernelPlanner::WipPlan::Channel* chan = &comm->planner.wipPlan.channels[channelId];
   // Conditions causing us to create a new blank batch.
@@ -921,11 +922,16 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
         }
         proxyOp->eActivationMask = task->eActivationMask;
         proxyOp->nChannels = nChannels;
+        // 添加 WorkBatch 到 Kernel Plan
+        // 925  WorkBatch(+已有 DevWorkColl)
+        //→ 「GPU：在 channel C 上跑哪个 func，用户 buffer 哪段、怎么切」
         ncclAddWorkBatchToPlan(comm, plan, c, workNode->workType, task->devFuncId, plan->workBytes);
         // Coverity reports "proxyOp->connection" as being possibly uninitialized.  It's hard to
         // determine if that's actually true but it's also not clear if that would be an issue.
         // coverity[uninit_use_in_call:FALSE]
-        NCCLCHECK(ncclAddProxyOpIfNeeded(comm, plan, proxyOp));
+        //  ProxyOp（若 needed）
+        //  → 「Proxy：在连接 X 上发/收多少步、块多大；零拷贝再挂 ringAlgo」
+        NCCLCHECK(ncclAddProxyOpIfNeeded(comm, plan, proxyOp)); // 添加 proxyOp 到 Kernel Plan，如果需要的话
       }
     }
     // 把整个 Kernel Plan 补完整

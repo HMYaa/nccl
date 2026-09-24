@@ -418,17 +418,17 @@ struct alignas(16) ncclDevWorkBatch {
       // nextJump=0: end of this channel's batch list
       // nextJump>0: batches[thisIndex+nextJump] is next batch in this list
       uint32_t nextJump:14, nextExtends:1;
-      uint32_t workType:2, funcId:15;
+      uint32_t workType:2, funcId:15; // work 类型和 funcId
     };
     // Unioning bitfields with underlying type hints compiler to emit the best
     // SASS LD/ST accesses.
     uint32_t flags;
   };
   // Rolling offset in fifo where this batch's work structs begin
-  uint32_t offsetBase;
+  uint32_t offsetBase; // work 在 fifo/args 里的起始偏移
   // Set of relative offsets from offsetBase for this channel's subset of the batch:
   // For each bit index i in offsetMask, find work at fifo offset: offsetBase + i*sizeof(WorkStructType)
-  uint64_t offsetBitset;
+  uint64_t offsetBitset; // 本 batch 在 fifo 中的偏移量集合，每个 bit 对应一个 work 结构体
 };
 
 // ncclChannelPeer 的 GPU 瘦身版：剥掉 vtable / transportResources / proxyConn 等 Host-only 字段，
