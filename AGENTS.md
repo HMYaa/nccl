@@ -40,8 +40,11 @@
 - 串讲核心数据结构时沿用「路线表 + 契约 + 快递单」心智模型（Channel/Connector → ConnInfo → ProxyArgs），函数视为在填这三张表。
 - 读代码按用户点名的单点（符号/函数）一步步下钻，先对齐理解再展开下一段。
 - 长函数/大段代码解释时，先给一个具体例子对齐理解，再展开细节；避免一上来长文。
+- 用户反馈难懂或不清时，改用更直白的例子、ASCII 图示或货单类比重讲，勿继续堆长梳理/字段枚举。
+- 细节粒度由用户定：用户说「先粗 / 细节后续」时只讲粗主链；细项等用户点名再下钻。
 - 用户要求查看 window/终端窗格内容并点名 Herdr 时，用 Herdr skill 读取并直接回答，勿绕路猜测。
 
 ## Learned Workspace Facts
 
 - 本仓用 Makefile 构建，无可用 CMakeLists；勿用 CMake Tools 配工程，clangd 依赖 `bear` + `make` 生成 `compile_commands.json`。
+- `groupLaunch` 默认走 `groupLaunchLegacy`（`NCCL_ENQUEUE_REARCH_ENABLE` 默认 0）；只有显式设为 1 才进 EnqueueRearch。
