@@ -1520,19 +1520,68 @@ ncclResult_t uploadWork_cleanup_fn(struct ncclComm* comm, struct ncclCommEventCa
 // 输出：Work 内容就位或异步上传已提交；补齐 workBuf/workMask，更新 offsetBase 和相关存储状态。
 // 这里复制的是 ncclDevWork* 描述（含用户 buffer 指针），用户的 collective 数据仍在原 buffer 中。
 //
-// plan->workQueue: [链表头|Work0] -> [链表头|Work1]
-//                         |                 |
-//                         +------复制-------+
-//                                  |
-//           +----------------------+----------------------+
-//           |                      |                      |
-// Args: kernelArgs         Fifo: 共享环形缓冲       Persistent: 独立存储
-// [header|batch[]|Work...]  [旧Work|本Plan Work|...]  [Host临时Work]
-//                 ^                ^                      |
-//            H + batchBytes   workFifoProduced       cudaMemcpyAsync
-//                                                        |
-//                                                   [Device Work]
-// H = sizeof(ncclDevKernelArgs)；batch[] 始终在 kernelArgs 中。
+// 先看复制源：Host 上的 Work 描述散在链表节点里，链表头不会复制给 GPU。
+//   plan->workQueue
+//     head --> [List | W0] --> [List | W1] --> null
+//                     |               |
+//                     +-- CPU memcpy -+--> 连续存储的 [W0 | W1]
+//
+// 下列三种模式择一执行；W0/W1 表示 Work 描述，省略 padding，Batches 已由 finishPlan 填好。
+// (a) Args：把正文填进参数包预留的空位，目录和正文随同一次 kernel launch 传递。
+//   CPU kernelArgs，复制前：
+//     [ Header ][ Batches ][       reserved       ]
+//                                CPU memcpy
+//                                    |
+//                                    v
+//   CPU kernelArgs，复制后：
+//     [ Header ][ Batches ][ W0 ][ W1 ]
+//     ^                   ^
+//     kernelArgs base     H + batchBytes
+//   GPU 从传入的参数包读取：args + offset；Header.workBuf = nullptr。
+//
+// (b) Fifo：多个 Plan 共用一个循环货架，各自占其中一段；旧 Work 消费完，货架位置可以复用。
+//   假设 Plan A 有 A0/A1，Plan B 有 B0/B1：两份参数包的 workBuf 指向同一个 FIFO 基址 F。
+//
+//   A.kernelArgs: [ Header: workBuf = F ][ Batches: A offsets ]
+//   B.kernelArgs: [ Header: workBuf = F ][ Batches: B offsets ]
+//
+//   CPU 写入：A.workQueue --memcpy--> A 区；B.workQueue --memcpy--> B 区。
+//   F --> [ ... ][ A: A0 | A1 ][ ... ][ B: B0 | B1 ][ free ... ]
+//   共用基址 F，靠各自 batch 的 offsetBase 找到不同 Work；实际取址还要 & (capacity - 1)。
+//   CPU 的 workFifoBuf 和 GPU 的 workFifoBufDev 是同一份存储的访问入口，无需这里再做 H2D 拷贝。
+//   写入起点取 workFifoProduced，写完游标前进；容量不足时等 kernel 完成事件回收空间。
+//
+//   时间轴（后续写游标回绕到 A 区时）：
+//   A 区 [ A0 | A1 ] --kernel读取A--> --确认可回收--> [ C0 | C1 ]
+//   FIFO 本身随 comm 保留；其中某个 Plan 的 Work 内容只在消费期间受保护，之后可被覆盖。
+//
+// (c) Persistent：每个 Plan 有自己的固定货架，Graph 下次执行还要读取同一份描述。
+//   同样是 Plan A 和 B，这次分配两个独立 device buffer：FA 和 FB。
+//
+//   A.workQueue --CPU memcpy--> Host A: [ A0 | A1 ]
+//                                          |
+//                                   cudaMemcpyAsync
+//                                          |
+//                                          v
+//   A.kernelArgs.workBuf ------------> FA: [ A0 | A1 ]
+//
+//   B.workQueue --CPU memcpy--> Host B: [ B0 | B1 ]
+//                                          |
+//                                   cudaMemcpyAsync
+//                                          |
+//                                          v
+//   B.kernelArgs.workBuf ------------> FB: [ B0 | B1 ]
+//
+//   A 的 batch offsetBase 相对 FA 从 0 起；B 的相对 FB 从 0 起，各自无需环形回绕。
+//   上传一次后，Graph 中的 A 可以重复执行：
+//     第 1 次读取 FA --> 第 2 次仍读取 FA --> 第 N 次仍读取 FA
+//   新 Plan C 分配自己的 FC，保留 A 的 FA；Host A/B 在各自复制完成后即可释放。
+//   FA/FB 随所属 Plan 保留到回收，第一次 kernel 完成后仍可供 Graph 重复使用。
+//   保留的是 Work 执行描述；它指向的用户输入/输出数据仍可随每次执行变化。
+//
+// GPU 最终找 Work 的方式（offset 含修正后的 offsetBase 与 batch 内偏移）：
+//   Args: args + offset；Fifo/Persistent: workBuf + (offset & workMask)。
+// H = sizeof(ncclDevKernelArgs)；batch 描述始终在 kernelArgs 中，复制的是它引用的 Work 内容。
 static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   // 这些任务使用各自的执行描述准备路径。
   if (plan->isSymColl || plan->isCeColl || plan->isRma) return ncclSuccess;
@@ -1704,16 +1753,48 @@ static void* gettaskEventHandle(struct ncclProxyOp* op) {
   return op->task.coll->eventHandle;
 }
 
+// 把 Plan 的 Proxy「快递单」接上本地共享资源的历史编号，再提交到对应连接的 Proxy 工作池。
+// 输入：finishPlan 整理好的 plan->proxyOpQueue，以及 comm->sharedRes 的历史计数器。
+// 输出：Proxy 工作池中的工作副本与前进后的历史计数；成功提交后，Plan 保留局部 opCount。
+// opCount 是排序/合批标识，同一操作在多个 channel/方向上可共用编号；它不是连接 step 进度。
+//
+// opCount 就是“序号 × 2 + 类型位”：偶数代表 Collective，奇数代表 P2P；右移一位就拿回真正的序号。
+//
+// opCount 编码 = (操作序号 << 1) | tag；tag=0 表示 collective，tag=1 表示 P2P。
+// 例：本 Plan 有 3 个 collective，历史起点为 10：
+//   Plan 局部序号：       0   1   2
+//   Plan 内 opCount：     0   2   4
+//   本轮提交序号：       10  11  12
+//   Proxy 副本 opCount： 20  22  24
+//   下一轮历史起点：13；按 collective 数量推进，不按 Proxy Op 节点数量推进。
+//
+// 单个 Op 的提交流程（以上例中局部序号 1 的 Op 为例）：
+//   Plan 原 Op: opCount=2
+//             |
+//             +-- 加上历史起点 (10 << 1) --> 临时 opCount=22
+//             |                                      |
+//             |                              ncclProxySaveOp
+//             |                                      |
+//             |                                      v
+//             |                              Proxy pool 副本
+//             |                              opCount=22 + connection
+//             |
+//             +-- 提交成功后恢复 oldId --> Plan 原 Op: opCount=2
+//   Graph 下次执行再次使用局部 opCount=2，叠加新的历史起点；已提交的副本仍保留本轮编号 22。
 static ncclResult_t uploadProxyOps(struct ncclComm* comm, struct ncclKernelPlan* plan) {
+  // ============ 1. 保存本轮 collective 起点，预留本 Plan 的编号范围 ============
   uint64_t collOpCount = comm->sharedRes->collOpCount;
-  uint64_t p2pOpBump[MAXCHANNELS] = {/*0...*/};
+  uint64_t p2pOpBump[MAXCHANNELS] = {/*0...*/}; // 各 channel 本轮需推进的 P2P 编号跨度，最后统一累加。
   // Advance comm's collOpCount by number of colls in this plan.
   int hasp2p = 0;
+  // 先推进 sharedRes 计数，下方转换仍使用局部变量保存的旧起点；comm 同步累计自身计数。
   comm->sharedRes->collOpCount += plan->collOpCount;
   comm->collOpCount += plan->collOpCount;
 
+  // ============ 2. 遍历快递单，补充观测信息并转换编号 ============
   struct ncclProxyOp* op = ncclIntruQueueHead(&plan->proxyOpQueue);
   while (op != nullptr) {
+    // 这些字段服务于 profiler 事件关联，不是 GPU/Proxy 之间的流水线同步状态。
     op->profilerContext = comm->profilerContext;
     op->eActivationMask = geteActivationMask(op);
     op->taskEventHandle = gettaskEventHandle(op);
@@ -1724,27 +1805,36 @@ static ncclResult_t uploadProxyOps(struct ncclComm* comm, struct ncclKernelPlan*
     // translate them to the tip of the comm's history.
     if (oldId & 1) {
       // p2p
+      // P2P 用每个 channel 独立的历史起点；本轮转换期间保持起点不变，保留最低位 tag=1。
       // opCount is monotonic increasing within a plan's channel so just
       // remember last value to compute max.
+      // 同 channel 局部序号单调增加：最后一个序号+1 即推进量，不能用 Op 节点数代替。
+      // 例：历史起点7，局部序号1/2 -> 提交序号8/9；推进量3，下一起点10。
       p2pOpBump[op->channelId] = (oldId >> 1) + 1; // +1 to ensure next plan doesn't collide
       op->opCount = (comm->sharedRes->p2pOpCount[op->channelId] << 1) + oldId;
       hasp2p = 1;
     } else {
       // coll
+      // Collective 共用本轮保存的历史起点；同一 collective 的各 channel/方向保持相同编号。
       op->opCount = (collOpCount << 1) + oldId;
     }
 
+    // ============ 3. 按 pattern/邻居选择 Connector，复制提交，再恢复模板编号 ============
+    // nullptr 表示实际提交；ncclProxySaveOp 内部可展开多个方向，在 ncclLocalOpAppend 中复制到 pool。
+    // pool 副本设置目标 proxy connection；Plan 的局部编号恢复后，副本的本轮编号仍不变。
     NCCLCHECK(ncclProxySaveOp(comm, op, nullptr));
     op->opCount = oldId; // Restore for next uploadProxyOps()
-    op = op->enqNext;
+    op = op->enqNext; // 仅遍历原队列，不把 Plan 节点出队。
   }
 
+  // ============ 4. 为后续提交推进每个 channel 的 P2P 历史起点 ============
   if (hasp2p) {
     for (int c = 0; c < MAXCHANNELS; c++) {
       // Advance channel's p2pOpCount by number of p2p's in this plan channel.
       comm->sharedRes->p2pOpCount[c] += p2pOpBump[c];
     }
   }
+  // 调用者随后用 ncclProxyStart 发布剩余待处理链；实际网络提交/完成检查由 transport progress 推进。
   return ncclSuccess;
 }
 
