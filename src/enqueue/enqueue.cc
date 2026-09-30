@@ -233,6 +233,116 @@ void ncclAddWorkBatchToPlan(struct ncclComm* comm, struct ncclKernelPlan* plan, 
   }
 }
 
+/*
+CPU侧分散对象
+│
+├── Plan header 信息
+├── 各 Channel 的 WorkBatch
+├── Work 描述
+└── ProxyOp
+        ↓
+    finishPlan()
+        ↓
+整理成 GPU 容易解析的连续布局
+
+Args 模式： 
+a. 如果东西比较少：
+kernelArgs
+┌──────────────────────┐
+│ ncclDevKernelArgs    │  ← 包头
+├──────────────────────┤
+│ WorkBatch[0]         │
+│ WorkBatch[1]         │  ← 目录/描述符
+│ ...                  │
+├──────────────────────┤
+│ Work0                │
+│ Work1                │  ← payload 也内联进来
+│ ...                  │
+├──────────────────────┤
+│ padding              │
+└──────────────────────┘
+类似：Header + descriptors + inline payload
+
+
+b.如果 Work 太多，就不全塞进 kernel 参数：
+kernelArgs
+┌──────────────────────┐
+│ ncclDevKernelArgs    │
+├──────────────────────┤
+│ WorkBatch[]          │
+├──────────────────────┤
+│ padding              │
+└──────────────────────┘
+          │
+          │ offsetBase / workBuf
+          ▼
+外部 Work 存储
+┌──────────────────────┐
+│ Work0                │
+│ Work1                │
+│ Work2                │
+└──────────────────────┘
+类似：
+Header + descriptor
+        ↓
+指向外部 payload
+
+
+转换的例子：
+
+原来情况：
+
+                    ncclKernelPlan
+                         │
+            ┌────────────┴────────────┐
+            │                         │
+        GPU侧准备                 Proxy侧准备
+            │                         │
+            ▼                         ▼
+
+plan->workQueue                wipChannel[0]
+  WorkA                          Proxy A0 (opCount=0)
+  WorkB                          Proxy B0 (opCount=2)
+                                     
+                               wipChannel[1]
+                                 Proxy A1 (opCount=0)
+                                 Proxy B1 (opCount=2)
+
+
+wipChannel[0].workBatchQueue
+  Batch A0 → Batch B0
+
+wipChannel[1].workBatchQueue
+  Batch A1 → Batch B1
+
+
+转换结果：
+  a. GPU 按照channel升序执行，每轮按 channel 编号升序，各取一个 batch。（BFS 遍历）
+  b. CPU Proxy 按照 opCount 顺序提交/推进网络工作。（类似链表）
+
+                         ncclKernelPlan
+                              │
+             ┌────────────────┴────────────────┐
+             │                                 │
+             ▼                                 ▼
+        GPU执行描述                       CPU Proxy描述
+             │                                 │
+             ▼                                 ▼
+         kernelArgs                     proxyOpQueue
+             │                                 │
+   ┌─────────┴─────────┐                  A-ch0(op0)
+   │                   │                       ↓
+ Header          WorkBatch[]                A-ch1(op0)
+                     │                        ↓
+                 [0] A0                   B-ch0(op2)
+                 [1] A1                      ↓
+                 [2] B0                   B-ch1(op2)
+                 [3] B1
+                     │
+              nextJump串联
+
+
+*/
 static void finishPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   ncclKernelPlanner::WipPlan::Channel* wipChannels = comm->planner.wipPlan.channels;
   size_t workBytes = plan->workBytes;
@@ -257,23 +367,36 @@ static void finishPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   // Put batches into the kernel arguments. The first batch for each channel
   // must be located at batchZero[blockIdx.x]. To achieve this we round robin
   // over the channels in ascending order until they're exhausted.
-  uint64_t hasBatchMask = plan->channelMask;
-  struct ncclDevWorkBatch* batchPrev[MAXCHANNELS] = {}; // {0...}
+  // Host/GPU 的布局约定：blockIdx.x 对应 channelMask 中第 blockIdx.x 个置位 bit 所代表的 channel。
+  // GPU 用 channelMask 得到真实 channelId，同时直接用 batchZero[blockIdx.x] 读取自己的首 batch。
+  // 因此第一轮必须先放每个活跃 channel 的首 batch；后续各轮按 channel 编号升序，各取一个 batch。
+  // 例：channel 2: A -> B -> C，channel 5: D，打包结果如下（channel 行仅说明归属，并非 batch 字段）：
+  //   数组下标：  0  1  2  3
+  //   batch：     A  D  B  C
+  //   channel：   2  5  2  2
+  //   nextJump：  2  0  1  0
+  // block 0 沿 0 -> 2 -> 3 执行 channel 2 的 batch；block 1 从下标 1 执行 channel 5 的 batch。
+  uint64_t hasBatchMask = plan->channelMask; // 尚有 batch 待取的 channel；只修改本地副本。
+  struct ncclDevWorkBatch* batchPrev[MAXCHANNELS] = {}; // 各 channel 上一份已写入数组的 batch；初始为空。
   struct ncclDevWorkBatch* batchZero = (struct ncclDevWorkBatch*)(plan->kernelArgs + 1);
-  int batchIx = 0;
+  int batchIx = 0; // 连续数组的下一个写入位置，独立于真实 channelId。
   while (hasBatchMask != 0) {
     uint64_t tmpMask = hasBatchMask; // channels with a batch for this round.
+    // tmpMask 是本轮快照：每个 channel 只访问一次，取最低置位 bit 保证本轮按 channel 编号升序。
     do {
       int c = popFirstOneBit(&tmpMask);
       if (!ncclIntruQueueEmpty(&wipChannels[c].workBatchQueue)) {
         struct ncclWorkBatchList* batchNode = ncclIntruQueueDequeue(&wipChannels[c].workBatchQueue);
         if (batchPrev[c] != nullptr) {
+          // 连接同一 channel 的前后 batch；指针差的单位是 batch 元素个数，允许跨过其他 channel 的 batch。
+          // GPU 按当前下标 + nextJump 找到下一份；末尾 batch 的 nextJump 保持初始值 0，表示结束。
           batchPrev[c]->nextJump = int(&batchZero[batchIx] - batchPrev[c]);
         }
         batchPrev[c] = &batchZero[batchIx];
         batchZero[batchIx++] = batchNode->batch;
       }
       if (ncclIntruQueueEmpty(&wipChannels[c].workBatchQueue)) {
+        // 队列取空后移出后续轮次；plan->channelMask 仍保留本次 launch 的全部活跃 channel。
         hasBatchMask ^= 1ull << c;
       }
     } while (tmpMask != 0);
@@ -281,6 +404,12 @@ static void finishPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
 
   // Merge-sort per-channel proxy-op lists by opCount when merging them into plan->proxyOpQueue
   // Phase 1: scan first op of each channel, store opCount in headIds[c].
+  // 按 channel 顺序扫描每个 channel 的第一个 proxy-op，存储 opCount 到 headIds[c]。
+  // GPU：
+  // 为了 blockIdx.x 快速找到工作
+ 
+  // CPU Proxy：
+  // 为了按照 opCount 顺序提交/推进网络工作
   uint64_t headIds[MAXCHANNELS];
   int nHeads = 0;
   int channelUbound = 0;
