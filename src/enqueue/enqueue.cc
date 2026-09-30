@@ -1515,30 +1515,55 @@ ncclResult_t uploadWork_cleanup_fn(struct ncclComm* comm, struct ncclCommEventCa
 }
 } // namespace
 
+// 把 plan->workQueue 中的 GPU 执行描述写入最终存储，并修正 batch 的 Work 字节偏移。
+// 输入：finishPlan 已排好的 batch 数组、Work 队列和 workStorageType。
+// 输出：Work 内容就位或异步上传已提交；补齐 workBuf/workMask，更新 offsetBase 和相关存储状态。
+// 这里复制的是 ncclDevWork* 描述（含用户 buffer 指针），用户的 collective 数据仍在原 buffer 中。
+//
+// plan->workQueue: [链表头|Work0] -> [链表头|Work1]
+//                         |                 |
+//                         +------复制-------+
+//                                  |
+//           +----------------------+----------------------+
+//           |                      |                      |
+// Args: kernelArgs         Fifo: 共享环形缓冲       Persistent: 独立存储
+// [header|batch[]|Work...]  [旧Work|本Plan Work|...]  [Host临时Work]
+//                 ^                ^                      |
+//            H + batchBytes   workFifoProduced       cudaMemcpyAsync
+//                                                        |
+//                                                   [Device Work]
+// H = sizeof(ncclDevKernelArgs)；batch[] 始终在 kernelArgs 中。
 static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* plan) {
+  // 这些任务使用各自的执行描述准备路径。
   if (plan->isSymColl || plan->isCeColl || plan->isRma) return ncclSuccess;
 
   size_t workBytes = plan->workBytes;
   size_t batchBytes = plan->nWorkBatches * sizeof(struct ncclDevWorkBatch);
-  void* fifoBufHost;
-  uint32_t fifoCursor, fifoMask;
+  void* fifoBufHost; // CPU 写入基址：参数缓冲、共享 FIFO，或临时 Host 缓冲。
+  uint32_t fifoCursor, fifoMask; // 逻辑字节游标与取址 mask；~0u 不回绕，FIFO 用容量-1 回绕。
 
+  // ============ 1. 选择目标存储与本 Plan 的写入起点 ============
   switch (plan->workStorageType) {
   case ncclDevWorkStorageTypeArgs:
+    // 直接填入 finishPlan 预留的 Work 区；GPU 从 kernel 参数读取，无需外部 workBuf。
     plan->kernelArgs->workBuf = nullptr;
     fifoBufHost = (void*)plan->kernelArgs;
     fifoCursor = sizeof(ncclDevKernelArgs) + batchBytes;
     fifoMask = ~0u;
     break;
   case ncclDevWorkStorageTypeFifo:
+    // Host/Device 指针是同一 FIFO 的两侧访问入口；游标累计计数，物理位置由 mask 映射。
     fifoBufHost = comm->workFifoBuf;
     fifoCursor = comm->workFifoProduced;
     fifoMask = comm->workFifoBytes - 1;
+    // 整批预留空间：(写完后的 Produced - Consumed) <= 容量，避免覆盖旧 kernel 仍使用的 Work。
+    // Consumed 由 kernel 完成事件回调更新；这里等待的是 Work 描述的存储空间。
     NCCLCHECK(waitWorkFifoAvailable(comm, fifoCursor + workBytes));
     plan->kernelArgs->workBuf = comm->workFifoBufDev;
     break;
   case ncclDevWorkStorageTypePersistent:
     {
+      // 先在 Host 上连续组装 Work，后面再上传到独立 device buffer，供 CUDA Graph 重复执行。
       size_t hostAllocBytes = workBytes;
 // We rely on 16-byte alignment. Use aligned alloc when available (C++11+ or MSVC with /std:c++11+).
 // MSVC keeps __cplusplus at 199711L
@@ -1559,32 +1584,46 @@ static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* pla
   }
   plan->kernelArgs->workMask = fifoMask;
 
+  // ============ 2. 将 Plan 内相对偏移换成最终存储偏移 ============
   // Batches were placed after kernelArgs by finishPlan(). Only thing left to
   // do is translate the work offset from zero based (in plan) to:
   //  ncclDevWorkStorageTypeArgs: offset from beginning of kernel args
   //  ncclDevWorkStorageTypeFifo: offset from base of fifo
   //  ncclDevWorkStorageTypePersistent: no translation since our dedicated buffer will also begin at zero.
+  // offsetBase 是字节偏移；nextJump 是 batch 数组元素间距，本函数只修正前者。
+  // 例：Work0/Work1 各 64B（示意），本 Plan 从 FIFO 逻辑偏移 1024 开始写：
+  //   Plan 内偏移：   Work0 @ 0     Work1 @ 64
+  //                         +1024       +1024
+  //   FIFO 逻辑偏移： Work0 @ 1024  Work1 @ 1088
+  // 所有 batch 加上同一个起点；同一 Work 可被多个 channel 的 batch 引用，内容只存一份。
   struct ncclDevWorkBatch* batchZero = (struct ncclDevWorkBatch*)(plan->kernelArgs + 1);
   for (int b = 0; b < plan->nWorkBatches; b++) {
     batchZero[b].offsetBase += fifoCursor;
   }
 
+  // ============ 3. 按 workQueue 顺序复制 channel 共享的 Work 描述 ============
   // Write the channel-shared work structs.
   struct ncclWorkList* workNode = ncclIntruQueueHead(&plan->workQueue);
   while (workNode != nullptr) {
     char* dst = (char*)fifoBufHost;
+    // 节点布局：[ncclWorkList 头|ncclDevWork* 内容]；跳过 Host 链表头，仅复制 size 字节的内容。
     char* src = (char*)(workNode + 1);
+    // Work 按 16B 对齐并分块复制；这是复制粒度，不表示 16B 原子发布。
+    // FIFO 容量为 2 的幂：例如容量 4096，逻辑偏移 4080 -> 4096 对应物理偏移 4080 -> 0。
     for (int n = workNode->size; n != 0; n -= 16) {
       memcpy(COMPILER_ASSUME_ALIGNED(dst + (fifoCursor & fifoMask), 16), COMPILER_ASSUME_ALIGNED(src, 16), 16);
       fifoCursor += 16;
       src += 16;
     }
-    workNode = workNode->next;
+    workNode = workNode->next; // 仅遍历，保留原 workQueue 节点。
   }
 
+  // ============ 4. 完成 FIFO 写入，或提交 Persistent 上传与回收 ============
+  // Args 模式的 Work 已填入参数缓冲，后续由 kernel launch 传递，无需这里再拷贝到 device。
   switch (plan->workStorageType) {
   case ncclDevWorkStorageTypeFifo:
     comm->workFifoProduced = fifoCursor;
+    // GDRCopy 映射可能使用 write-combining；fence 约束 CPU 写入，供后续 kernel 使用这些 Work。
     if (comm->workFifoBufGdrHandle != nullptr) wc_store_fence();
     break;
   case ncclDevWorkStorageTypePersistent:
@@ -1595,6 +1634,7 @@ static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* pla
       void* fifoBufDev = nullptr;
       cudaStream_t deviceStream;
 
+      // 临时放宽当前线程的 capture 限制；下面用非捕获 stream 准备长期存储，退出时恢复原模式。
       CUDACHECKGOTO(cudaThreadExchangeStreamCaptureMode(&mode), result, fail);
 
       // Acquire deviceStream. Since the user's graph will be launched later and it also
@@ -1603,10 +1643,13 @@ static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* pla
                                             &comm->sharedRes->deviceStream, /*concurrent=*/false, &deviceStream),
                     result, fail);
 
+      // Host临时Work --异步复制--> Device长期Work --Graph执行--> Plan回收时释放
+      //      |
+      //      +-- memcpyDone事件完成 --> uploadWork_cleanup_fn释放Host缓冲
       CUDACHECKGOTO(cudaMallocAsync(&fifoBufDev, workBytes, comm->memPool, deviceStream), result, fail);
       INFO_LOC(NCCL_ALLOC, "Persistent cudaMallocAsync work buf Size %zu pointer %p", workBytes, fifoBufDev);
-      plan->workBufPersistent = fifoBufDev;
-      plan->kernelArgs->workBuf = fifoBufDev;
+      plan->workBufPersistent = fifoBufDev; // Host 回收 Plan 时使用，释放这份独立 device 存储。
+      plan->kernelArgs->workBuf = fifoBufDev; // GPU 读取 Work 的入口；与上面的指针指向同一 buffer。
 
       // coverity[uninit_use_in_call:FALSE] => fifoBufHost is never NULL
       CUDACHECKGOTO(cudaMemcpyAsync(fifoBufDev, fifoBufHost, workBytes, cudaMemcpyDefault, deviceStream), result, fail);
@@ -1618,6 +1661,7 @@ static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* pla
       cleanup->base.fn = uploadWork_cleanup_fn;
       cleanup->base.event = memcpyDone;
       cleanup->hostBuf = fifoBufHost;
+      // 将临时 Host 缓冲交给事件回调管理；异步复制完成后才可释放。
       ncclIntruQueueEnqueue(&comm->eventCallbackQueue, (struct ncclCommEventCallback*)cleanup);
 
       NCCLCHECKGOTO(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode),
@@ -1627,6 +1671,7 @@ static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* pla
 
     finish_scope:
       if (mode != cudaStreamCaptureModeRelaxed) (void)cudaThreadExchangeStreamCaptureMode(&mode);
+      // 成功表示上传操作已提交；完成和后续 Graph 可见性由 stream/event 顺序保证。
       return result;
     fail:
       if (!cleanup) ncclOsAlignedFree(fifoBufHost);
