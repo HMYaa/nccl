@@ -38,3 +38,8 @@ docs/examples/**/rmsnorm_hybrid
 src/.serena/
 doc/archify/*.visual-check.*
 *.code-workspace
+
+# clangd / local IDE (machine-specific)
+compile_commands.json
+.clangd
+.vscode/
