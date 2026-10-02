@@ -2170,15 +2170,22 @@ NCCL_PARAM(MemSyncDomain, "MEM_SYNC_DOMAIN", cudaLaunchMemSyncDomainRemote);
 ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   ncclResult_t ret = ncclSuccess;
   struct ncclKernelPlanner* planner = &comm->planner;
-  int nChannels = countOneBits(plan->channelMask);
-  void* sym = plan->kernelFn;
-  dim3 grid = {(unsigned)nChannels, 1, 1};
-  dim3 block = {(unsigned)plan->threadPerBlock, 1, 1};
+  int nChannels = countOneBits(plan->channelMask); // 计算通道数
+  void* sym = plan->kernelFn; // 执行哪个 kernel 入口
+  dim3 grid = {(unsigned)nChannels, 1, 1}; // 网格维度，channel数
+  dim3 block = {(unsigned)plan->threadPerBlock, 1, 1}; // 块维度，每个块的线程数
   int smem = plan->isSymColl ? plan->kernelDynSmem : ncclShmemDynamicSize(comm->cudaArch);
   cudaStream_t launchStream = planner->streams->stream;
 
   NCCLCHECK(ncclProfilerStartKernelLaunchEvent(plan, launchStream));
-
+  /*
+    void* extra[] = {
+    CU_LAUNCH_PARAM_BUFFER_POINTER, buf,     // 标签 + 值：参数字节从 buf 开始
+    CU_LAUNCH_PARAM_BUFFER_SIZE,    &size,   // 标签 + 值：一共 size 字节
+    CU_LAUNCH_PARAM_END                      // 结束标记
+  };
+  driver 不看形参类型，直接把 buf 开始的 size 字节拷进 kernel 参数区
+  */
   void* extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, plan->kernelArgs, CU_LAUNCH_PARAM_BUFFER_SIZE, &plan->kernelArgsSize,
                    CU_LAUNCH_PARAM_END};
 
@@ -2186,8 +2193,8 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   NCCLCHECKGOTO(ncclCudaDriverVersion(&driverVersion), ret, do_return);
 
   CUfunction fn;
-  CUDACHECKGOTO(cudaGetFuncBySymbol(&fn, sym), ret, do_return);
-
+  CUDACHECKGOTO(cudaGetFuncBySymbol(&fn, sym), ret, do_return); // 获取 kernel 入口
+  // 主路径：CUDA runtime 和 driver 都 ≥ 11.8 时，用 cuLaunchKernelEx 加上属性。
   if (CUDART_VERSION >= 11080 && driverVersion >= 11080) {
 #if CUDART_VERSION >= 11080
     int compCap = comm->compCap;
@@ -2256,7 +2263,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     CUCHECKGOTO(cuLaunchKernelEx(&launchConfig, fn, nullptr, extra), ret, do_return);
 #endif
   } else {
-    // Standard kernel launch
+    // Standard kernel launch  兜底路径：版本不够时，用普通的 cuLaunchKernel，所有属性都不带。
     CUCHECKGOTO(cuLaunchKernel(fn, grid.x, grid.y, grid.z, block.x, block.y, block.z, smem, launchStream, nullptr,
                                extra),
                 ret, do_return);
