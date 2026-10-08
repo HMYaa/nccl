@@ -477,26 +477,32 @@ bool ncclTestBudget(struct ncclKernelPlanBudget* budget, int nWorkBatches, ssize
   return ok;
 }
 
-// 一句话：把 collTaskQueue 里每张货单，做成一张给 GPU 看的「贴纸」DevWorkColl，排进 collWorkQueue。
+// 将 collTaskQueue 中已选型的 task，逐项配上供 GPU 使用的 work 描述，排进 collWorkQueue。
+// 普通路径：尝试缓冲区注册 → 填写 ncclDevWorkColl → 包装为 ncclWorkList 节点 → 入队。
+// NVLS/NVLS_TREE 路径：直接取用 ncclPrepareTasks 已放入 tmpCollWorkQueue 的 work 节点。
+// task 队列保留原任务，work 队列按相同顺序保存描述，供后续排产成对读取。
+// 本函数在 CPU 侧准备元数据；具体 channel 和数据分块信息由后续排产补齐。
 ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
   struct ncclKernelPlanner* planner = &comm->planner;
   struct ncclTaskColl* task;
   task = ncclIntruQueueHead(&planner->collTaskQueue);
   while (task != nullptr) {
-    // Build a ncclDevWorkColl[Reg?] struct for each task.
+    // ============ 1. 获取当前 task 对应的 work，或准备注册后新建 ============
     void* regBufSend[NCCL_MAX_LOCAL_RANKS];
     void* regBufRecv[NCCL_MAX_LOCAL_RANKS];
     bool regNeedConnect = true;
     struct ncclWorkList* workNode = NULL;
     struct ncclDevWorkColl devWork = {};
 
+    // ncclPrepareTasks 已处理 NVLS 注册并构造 work；按 NVLS 任务的相对顺序取用。
     if (task->algorithm == NCCL_ALGO_NVLS_TREE || task->algorithm == NCCL_ALGO_NVLS) {
       workNode = ncclIntruQueueDequeue(&planner->tmpCollWorkQueue);
       goto next;
     }
-    // 注册所需缓冲区
+    // 按算法、协议及配置尝试注册；注册结果记录在 task->regBufType 等字段中。
     ncclRegisterCollBuffers(comm, task, regBufSend, regBufRecv, &planner->collCleanupQueue, &regNeedConnect);
-    // 组装 ncclDevWorkColl
+    // ============ 2. 将 task 的执行信息填入基础 work 描述 ============
+    // 传递缓冲区地址/偏移、归约参数及执行标志；这里复制的是描述字段，用户数据留在原缓冲区。
     devWork.sendbuff = (void*)task->sendbuff;
     devWork.recvbuff = (void*)task->recvbuff;
     devWork.sendbuffOffset = task->sendbuffOffset;
@@ -514,13 +520,17 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
     if (task->regBufType & NCCL_NET_REG_BUFFER) devWork.netRegUsed = 1;
     if (task->regBufType & (NCCL_IPC_REG_BUFFER | NCCL_NVLS_REG_BUFFER)) devWork.regUsed = 1;
 
+    // ============ 3. 将 work 描述包装成 CPU 队列节点 ============
+    // ncclWorkList 是链表节点类型，next 是节点内指向下一节点的字段：
+    // [ncclWorkList] --next--> [ncclWorkList] --next--> nullptr
+    // 内存布局：[ncclWorkList 头 | work 描述]；workType/size 标识后随描述的类型/字节数。
+    // workNode + 1 指向描述起始处，memcpy 将栈上的临时描述保存到 memScoped 分配的内存中。
     if (task->regBufType & NCCL_NVLS_REG_BUFFER) {
       struct ncclDevWorkCollReg workReg = {};
-      workReg.coll = devWork; // C++ struct assignment
-      /* NVLS only has one send and recv buffer registered */
+      // 扩展格式在基础 work 之外附带 NVLS 注册地址；NVLS 仅使用一对注册缓冲区地址。
+      workReg.coll = devWork;
       workReg.dnInputs[0] = regBufSend[0];
       workReg.dnOutputs[0] = regBufRecv[0];
-      // 包上 ncclWorkList 类型/长度信息
       workNode = ncclMemoryStackAllocInlineArray<ncclWorkList, ncclDevWorkCollReg>(&comm->memScoped, 1);
       workNode->workType = ncclDevWorkTypeCollReg;
       workNode->size = sizeof(struct ncclDevWorkCollReg);
@@ -532,10 +542,12 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
       memcpy((void*)(workNode + 1), (void*)&devWork, workNode->size);
     }
   next:
-    // planner.collWorkQueue
+    // ============ 4. 统一入队，保持 task 与 work 的顺序一一对应 ============
+    // 新建节点和复用的 NVLS 节点都进入 collWorkQueue；遍历不移除 collTaskQueue 中的 task。
     ncclIntruQueueEnqueue(&planner->collWorkQueue, workNode);
     task = task->next;
   }
+  // 所有 NVLS task 处理完后，其预制 work 应恰好取尽；残留说明任务与临时 work 未正确配对。
   if (!ncclIntruQueueEmpty(&planner->tmpCollWorkQueue)) {
     WARN("Temporary collective work queue is not empty");
     return ncclInternalError;
