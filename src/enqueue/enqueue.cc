@@ -798,78 +798,100 @@ Task Queue
    ↓
 ncclKernelPlan ready
 */
+// 将 planner 中一段待排产 collective task/work 装入调用方已创建的当前 plan。
+// 主线：按描述存储预算预选任务 → 按调度类别统计负载 → 将 task 数据范围分配到 channel
+//   → 补齐已有 GPU work，收集各 channel 的 batch/ProxyOp → 将 task/work 移入当前 plan。
+// 一个 collective task 整体进入某个 plan；其数据在该 plan 内分给多个 channel、按 chunk 执行。
+// workBytes 是描述占用的字节数，traffic 是均衡 channel 负载用的估计量。
+// batch/ProxyOp 暂存在 wipPlan.channels；调用方随后用 finishPlan 打包参数并合并 ProxyOp。
+// 描述预算不足时返回 ncclSuccess，保留尚未移出的 task/work，由后续 plan 继续排产。
 static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKernelPlan* plan,
                                             struct ncclKernelPlanBudget* budget) {
   struct ncclKernelPlanner* planner = &comm->planner;
-  // Estimate number of tasks that will fit in this plan.
+
+  // ============ 1. 预选候选任务，并统计各调度类别的负载与 channel 配额 ============
+  // 第一遍只遍历待排产队列；nPlanColls 是候选数，实际装入时还会再次检查描述存储预算。
   int nPlanColls = 0;
-  size_t trafficBytes[2 * 2] = {0, 0, 0, 0}; // [collnet][nvls]
-  int nChannels[2 * 2] = {0, 0, 0, 0}; // [collnet][nvls]
-  int const nMaxChannels[2 * 2] = {comm->nChannels, comm->nvlsChannels, // [collnet][nvls]
+  // kind = 2 * isCollnet + isNvls，对应 [0][0]、[0][1]、[1][0]、[1][1] 四种调度类别。
+  // trafficBytes 累计调度负载；nChannels 累计 channel 配额；nMaxChannels 限定该类别可用 channel 数。
+  size_t trafficBytes[2 * 2] = {0, 0, 0, 0};
+  int nChannels[2 * 2] = {0, 0, 0, 0};
+  int const nMaxChannels[2 * 2] = {comm->nChannels, comm->nvlsChannels,
                                    comm->nChannels, std::min(comm->nChannels, comm->nvlsChannels)};
-  constexpr size_t MinTrafficPerChannel = 32 << 10; // 32K traffic as minimal
+  // 32 KiB 调度负载：用于每条候选任务的统计下限，以及后续 cell 的数据粒度换算。
+  constexpr size_t MinTrafficPerChannel = 32 << 10;
   do {
+    // 这里只累计 work 描述字节数；batch 目录开销由 ncclTestBudget 另算。
     size_t workBytes = 0;
     struct ncclTaskColl* task = ncclIntruQueueHead(&planner->collTaskQueue);
     struct ncclWorkList* workNode = ncclIntruQueueHead(&planner->collWorkQueue);
     while (task != nullptr) {
-      int nBatches = divUp(nPlanColls, 4); // Rough guess: 4 colls per batch.
+      // 预选时粗估约每 4 个 collective 一个 batch；实际还取决于 channel、funcId 等。
+      int nBatches = divUp(nPlanColls, 4);
       if (!ncclTestBudget(budget, nBatches, workBytes + workNode->size)) goto plan_full;
 
-      // A per-call-configured collective is scheduled alone in its own plan so its
-      // resource caps are realized exactly rather than blended into the plan's shared
-      // per-kind channel budget.
+      // aggIsolate 任务单独占据本轮 collective 候选集，避免与其他 collective 混排资源配置。
       bool taskAggIsolate = task->aggIsolate;
-      if (taskAggIsolate && nPlanColls > 0) goto plan_full; // leave it to start a fresh plan
+      if (taskAggIsolate && nPlanColls > 0) goto plan_full;
 
       nPlanColls += 1;
       workBytes += workNode->size;
-      int kind = 2 * task->isCollnet + task->isNvls; // 不同类型任务分组统计
-      trafficBytes[kind] += std::max(MinTrafficPerChannel, task->trafficBytes); //  总 traffic = X
-      // minCTAs/maxCTAs are resolved (env > per-call > comm) at task-append time, so they are
-      // applied unconditionally; comm defaults (minCTAs=1, maxCTAs=MAXCHANNELS) are no-ops on the base.
-      // We must check the minCTAs first to avoid the case where task->minCTAs > task->maxCTAs.
-      // For example, comm's min/max CTAs set to [8, 32] and config only set maxCTAs=4.
-      // We would have task->minCTAs=8 and task->maxCTAs=4.
+      int kind = 2 * task->isCollnet + task->isNvls;
+      trafficBytes[kind] += std::max(MinTrafficPerChannel, task->trafficBytes);
+
+      // 应用 task 已解析的资源配置：先 minCTAs、再 maxCTAs，冲突时以上限为准。
       task->nMaxChannels = std::max<int>(task->nMaxChannels, task->minCTAs);
       task->nMaxChannels = std::min<int>(task->nMaxChannels, task->maxCTAs);
-      // nvlsCTAs has no comm default (UNDEF == no cap), so it is applied only when resolved to a value.
+
+      // nvlsCTAs 未定义时不额外裁剪；定义时约束带 NVLS 调度标志的任务。
       if (task->isNvls && task->nvlsCTAs != NCCL_CONFIG_UNDEF_INT)
         task->nMaxChannels = std::min<int>(task->nMaxChannels, task->nvlsCTAs);
-      nChannels[kind] += task->nMaxChannels;   // 统计当前类型任务可用的 Channel 数
-      nChannels[kind] = std::min(nChannels[kind], nMaxChannels[kind]);  // 确保不超过上限
+      // 汇总本类别的 channel 配额，并限制在该类别的可用 channel 上限内。
+      nChannels[kind] += task->nMaxChannels;
+      nChannels[kind] = std::min(nChannels[kind], nMaxChannels[kind]);
       task = task->next;
       workNode = workNode->next;
-      if (taskAggIsolate) goto plan_full; // configured collective is alone in this plan
+      if (taskAggIsolate) goto plan_full;
     }
   plan_full:;
   } while (0);
 
+  // ============ 2. 逐个排产候选任务，补齐 GPU work 与各 channel 的调度描述 ============
+  // 同类别任务共享分配游标：前一 task 未用完的目标负载，可由下一 task 继续填入。
+  // trafficPerChannel 是每根 channel 的目标负载；channelId/currentTraffic 是当前游标及已分配负载。
+  // 这些量用于均衡工作，不表示 channel 缓冲区的容量。
   int kindPrev = -1;
-  size_t trafficPerChannel = 0; // 每个 Channel 希望承担多少通信工作量。 ≈ 总traffic / channel数
-  int channelId = 0; // 游标：下一个 Task 从哪根 channel 开始接。从 0 开始，依次递增，直到 nMaxChannels[kind] - 1
-  size_t currentTraffic = 0; // 当前 Channel 已承担的通信工作量
+  size_t trafficPerChannel = 0;
+  int channelId = 0;
+  size_t currentTraffic = 0;
   while (nPlanColls != 0 && !ncclIntruQueueEmpty(&planner->collTaskQueue)) {
     struct ncclTaskColl* task = ncclIntruQueueHead(&planner->collTaskQueue);
     struct ncclWorkList* workNode = ncclIntruQueueHead(&planner->collWorkQueue);
+    // task/work 队列逐项对应；跳过 CPU 链表头，取得前一阶段已经准备的 GPU work。
     struct ncclDevWorkColl* devWork = (struct ncclDevWorkColl*)(workNode + 1);
-    size_t elementSize = ncclTypeSize(task->datatype); // 元素大小
+    size_t elementSize = ncclTypeSize(task->datatype);
 
     int kind = 2 * task->isCollnet + task->isNvls;
+    // 队列按类别连续排列；类别变化时重算平均目标负载（16B 对齐），并从 channel 0 重新排。
     if (kind != kindPrev) {
       trafficPerChannel = divUp(trafficBytes[kind] / nChannels[kind], 16) * 16;
       kindPrev = kind;
       channelId = 0;
       currentTraffic = 0;
     }
-    // Task 按顺序、可切分地填入 Channel；同一个 Channel 也可能先后承载不同 Task。
-    if (task->isCollnet) { // collnet Task 单独处理
+
+    // ---- (a) isCollnet 调度类：每个 task 使用从 0 开始的 channel 区间，均分任务数据 ----
+    // 此标志也可能来自多节点 NVLS，表示调度方式；普通 Ring 主线走下面的 else。
+    if (task->isCollnet) {
       int nChannels = task->nMaxChannels;
-      // Ensure room for worst case of one new batch per channel
+
+      // 按最坏情况为每个参与 channel 预留一个新 batch，加上本 task 的一份 work 描述。
+      // 预算不足就结束本轮；当前 task/work 尚未出队，留给下一个 plan。
       if (!ncclTestBudget(budget, plan->nWorkBatches + nChannels, plan->workBytes + workNode->size)) {
         return ncclSuccess;
       }
 
+      // chunk 计算使用缓冲区规模的字节换算，而不是调度 traffic；AllReduce 此处不乘 2。
       size_t globalBytesPerElement = elementSize * ncclFuncMaxSendRecvCount(task->func, comm->nRanks, 1);
       struct ncclProxyOp proxyOp;
       uint32_t chunkSize, directFlags = 0;
@@ -880,11 +902,15 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
       task->channelLo = 0;
       task->channelHi = (uint8_t)(nChannels - 1);
       task->nChannels = (uint8_t)nChannels;
+      // work 保存总 count，GPU 再按参与的 channel 均分数据。
       devWork->collnet.count = task->count;
       devWork->collnet.chunkCount = chunkSize / ncclTypeSize(task->datatype);
       devWork->direct = directFlags;
 
+      // 同一 task 的各 channel 共用 opCount；最低位 0 标识 collective。
       uint64_t proxyOpId = uint64_t(plan->collOpCount++) << 1 | 0;
+      // 每个 channel 的 batch 记录 funcId，并引用同一份 work（plan 内偏移为 plan->workBytes）。
+      // batch 与所需 ProxyOp 暂存到 wipPlan.channels[c]，供 finishPlan 后续整理。
       for (int c = devWork->channelLo; c <= (int)devWork->channelHi; c++) {
         proxyOp.channelId = c;
         proxyOp.opCount = proxyOpId;
@@ -894,84 +920,88 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
         ncclAddWorkBatchToPlan(comm, plan, c, workNode->workType, task->devFuncId, plan->workBytes);
         NCCLCHECK(ncclAddProxyOpIfNeeded(comm, plan, &proxyOp));
       }
-    } else { // 非collnet Task 一起处理，需要切分到多个 Channel
-      // 心智：Task = 一串 cell；channel 容量 = 大约 cellsPerChannel 个 cell。
-      // 策略：按 traffic 分配 cell，尽量填满每个 channel。
-      /*
-          channelLo                    channelHi
-              │                            │
-              ▼                            ▼
-            [ Lo ][ Mid ][ Mid ]...[ Mid ][ Hi ]
-              ↑      ↑                       ↑
-            接游标剩余  满管                  最后一截（可空）
-      */
-      // not task->isCollnet
-      int trafficPerByte = ncclFuncTrafficPerByte(task->func, comm->nRanks); // 用户 buffer 里 1 个字节，换算成多少“网络工作量单位”，算法决定网络倍率
-      if (task->protocol == NCCL_PROTO_LL) trafficPerByte *= 4; // LL 协议倍率4
-      size_t cellSize = divUp(divUp(MinTrafficPerChannel, (size_t)trafficPerByte), 16) * 16; // 每个 Cell 包含多少个字节
-      int elementsPerCell = cellSize / elementSize; // 每个 Cell 包含多少个元素
-      size_t cells = divUp(task->count * elementSize, cellSize); // 总共有多少个 Cell
-      size_t trafficPerElement = elementSize * trafficPerByte; // 每个元素的通信工作量
-      size_t trafficPerCell = cellSize * trafficPerByte; // 每个 Cell 的通信工作量
-      size_t cellsPerChannel = std::min(cells, divUp(trafficPerChannel, trafficPerCell)); // 每个 Channel 希望承载多少个 Cell
-      size_t cellsLo; // 塞进当前 channel 剩余空位的 cell 数
-      if (channelId + 1 == nMaxChannels[kind]) { // 最后一根 channel，把所有 cell 都塞进去
-        // On last channel everything goes to "lo"
+    } else {
+      // ---- (b) 普通主线：按 cell 将连续数据范围分成首段 Lo、中段 Mid、尾段 Hi ----
+      // cell 是 channel 分配的数据粒度；chunk 是后面另行计算的传输分块。
+      // 例：task 有 10 cells，当前 channel 的目标负载还可接 2，后续每根目标为 3：
+      //   channelLo                             channelHi
+      //       [ Lo:2 ][ Mid:3 ][ Mid:3 ][ Hi:2 ]
+      // Lo 接续前一 task 的游标，各 Mid 等大，Hi 收尾；单 channel 时只有 Lo。
+
+      // trafficPerByte 按 collective 类型和 nRanks 换算调度负载（AllReduce 为 2），LL 再乘权重 4。
+      // 这是排产估计量，并非实测网络流量；cell 约对应 32 KiB 负载，数据字节数对齐到 16B。
+      int trafficPerByte = ncclFuncTrafficPerByte(task->func, comm->nRanks);
+      if (task->protocol == NCCL_PROTO_LL) trafficPerByte *= 4;
+      size_t cellSize = divUp(divUp(MinTrafficPerChannel, (size_t)trafficPerByte), 16) * 16;
+      int elementsPerCell = cellSize / elementSize;
+      size_t cells = divUp(task->count * elementSize, cellSize);
+      size_t trafficPerElement = elementSize * trafficPerByte;
+      size_t trafficPerCell = cellSize * trafficPerByte;
+      size_t cellsPerChannel = std::min(cells, divUp(trafficPerChannel, trafficPerCell));
+      // 将 task 数据向上取整为 cells，再按当前 channel 的剩余目标负载决定 Lo 能接多少。
+      size_t cellsLo;
+      // 已到本类别最后可用 channel 时，全部剩余数据记入 Lo，即使超过平均目标负载。
+      if (channelId + 1 == nMaxChannels[kind]) {
         cellsLo = cells;
       } else {
-        cellsLo = std::min(cells, divUp((trafficPerChannel - currentTraffic), trafficPerCell)); // 塞进当前 channel 剩余空位的 cell 数
+        cellsLo = std::min(cells, divUp((trafficPerChannel - currentTraffic), trafficPerCell));
       }
-      int nMidChannels = (cells - cellsLo) / cellsPerChannel; // 中间 channel 数
-      size_t cellsHi = (cells - cellsLo) % cellsPerChannel; //落到最后一根 channel 的剩余 cell 数
-      int nChannels = (cellsLo != 0 ? 1 : 0) + nMidChannels + (cellsHi != 0 ? 1 : 0); // 总 channel 数
-      if (nMaxChannels[kind] < channelId + nChannels) { // 超过上限，需要调整
-        // Overflowed available channels
+      int nMidChannels = (cells - cellsLo) / cellsPerChannel;
+      size_t cellsHi = (cells - cellsLo) % cellsPerChannel;
+      int nChannels = (cellsLo != 0 ? 1 : 0) + nMidChannels + (cellsHi != 0 ? 1 : 0);
+      // 预计区间超出可用 channel 上限：增大后续每根承担的 cells，将数据装入剩余可用 channel。
+      if (nMaxChannels[kind] < channelId + nChannels) {
         nMidChannels = nMaxChannels[kind] - channelId - 2;
-        cellsPerChannel = (cells - cellsLo) / (nMidChannels + 1); // 重新计算每个 channel 希望承载的 cell 数
-        cellsHi = cellsPerChannel + (cells - cellsLo) % (nMidChannels + 1); // 重新计算最后一根 channel 的剩余 cell 数
+        cellsPerChannel = (cells - cellsLo) / (nMidChannels + 1);
+        cellsHi = cellsPerChannel + (cells - cellsLo) % (nMidChannels + 1);
       }
+      // 整除而没有尾段时，将最后一个完整 Mid 改记为 Hi，维持首/中/尾的表示方式。
       if (cellsHi == 0 && nMidChannels != 0) {
-        cellsHi = cellsPerChannel; // 最后一根 channel 的剩余 cell 数为 0，需要调整
-        nMidChannels -= 1; // 中间 channel 数减 1
+        cellsHi = cellsPerChannel;
+        nMidChannels -= 1;
       }
-      if (cellsLo == 0) { // 当前 channel 剩余空位为 0，需要调整
-        // Least channel skipped. Make the next channel the new least.
+      // 首段无数据时跳过当前 channel，将下一段改记为 Lo，并相应减少 Mid 或清空 Hi。
+      if (cellsLo == 0) {
         channelId += 1;
         if (nMidChannels == 0) {
-          cellsLo = cellsHi; // 下一根 channel 的剩余 cell 数为 0，需要调整
+          cellsLo = cellsHi;
           cellsHi = 0;
         } else {
-          cellsLo = cellsPerChannel; // 下一根 channel 的剩余 cell 数为 0，需要调整
+          cellsLo = cellsPerChannel;
           nMidChannels -= 1;
         }
       }
-      size_t countMid = nMidChannels != 0 ? cellsPerChannel * elementsPerCell : 0; // 每一根 mid channel 各自的 element 数，不是 mid 段总和；
-      size_t countLo = cellsLo * elementsPerCell; // 第一根 channel 的 element 数
-      size_t countHi = cellsHi * elementsPerCell; // 最后一根 channel 的 element 数
+      // cells 换成元素数：countMid 是每根 Mid 的大小，总量为 countLo + nMidChannels*countMid + countHi。
+      size_t countMid = nMidChannels != 0 ? cellsPerChannel * elementsPerCell : 0;
+      size_t countLo = cellsLo * elementsPerCell;
+      size_t countHi = cellsHi * elementsPerCell;
+      // 扣除 cell 向上取整产生的多余元素，落在最后有数据的一段（Hi，或仅有的 Lo）。
       (countHi != 0 ? countHi : countLo) -= cells * elementsPerCell - task->count;
 
+      // 尾段裁剪后可能为空，重算实际参与 channel 数，并传播给 profiler。
       nChannels = (countLo != 0 ? 1 : 0) + nMidChannels + (cellsHi != 0 ? 1 : 0);
 
-      // Update number of channels propagated to the profiler
-      task->nChannels = (uint8_t)nChannels; // 记录该 Task 要使用的 Channel 数
+      task->nChannels = (uint8_t)nChannels;
 
-      // Ensure room for worst case of one new batch per channel
+      // 按最坏情况为每个参与 channel 预留一个新 batch，加上本 task 的一份 work 描述。
+      // 预算不足就结束本轮；当前 task/work 尚未出队，留给下一个 plan。
       if (!ncclTestBudget(budget, plan->nWorkBatches + nChannels, plan->workBytes + workNode->size)) {
         return ncclSuccess;
       }
 
-      devWork->channelLo = channelId; // 第一根 channel 的 ID
-      devWork->channelHi = channelId + nChannels - 1; // 最后一根 channel 的 ID
-      task->channelLo = (uint8_t)channelId; // 第一根 channel 的 ID
-      task->channelHi = (uint8_t)(channelId + nChannels - 1); // 最后一根 channel 的 ID
-      devWork->cbd.countLo = countLo; // 第一根 channel 的 element 数
-      devWork->cbd.countMid = countMid; // 每一根 mid channel 各自的 element 数，不是 mid 段总和；
-      devWork->cbd.countHi = countHi; // 最后一根 channel 的 element 数
+      // 写入 channel 区间及 Lo/Mid/Hi 元素数；GPU 用 ncclCollCbdPart 还原自己的数据范围。
+      devWork->channelLo = channelId;
+      devWork->channelHi = channelId + nChannels - 1;
+      task->channelLo = (uint8_t)channelId;
+      task->channelHi = (uint8_t)(channelId + nChannels - 1);
+      devWork->cbd.countLo = countLo;
+      devWork->cbd.countMid = countMid;
+      devWork->cbd.countHi = countHi;
 
-      // calcCollChunking() uses global bytes instead of traffic which differs
-      // in that allreduce isn't multiplied by 2.
+      // chunk 计算使用缓冲区规模的字节换算，而不是调度 traffic；AllReduce 此处不乘 2。
       size_t globalBytesPerElement = elementSize * ncclFuncMaxSendRecvCount(task->func, comm->nRanks, 1);
-      struct ncclProxyOp proxyOpLo, proxyOpMid, proxyOpHi; // 每个 channel 的 proxyOp
+      // Lo/Mid/Hi 各计算一份 chunk/ProxyOp 模板，所有 Mid 使用相同大小的模板。
+      struct ncclProxyOp proxyOpLo, proxyOpMid, proxyOpHi;
 
       uint32_t chunkSize, directFlags = 0;
       size_t grainSize = ncclProtoGrainSize(task->protocol);
@@ -992,44 +1022,49 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
       }
       devWork->direct = directFlags;
 
-      // Update the current channel and vacant traffic budget.
+      // 更新同类别下一 task 的分配起点：停在未填完的尾 channel，或前进到下一根。
       if (countHi != 0) {
-        channelId += nChannels - 1; // 最后一根 channel，更新游标
+        channelId += nChannels - 1;
         currentTraffic = cellsHi * elementsPerCell * trafficPerElement;
       } else if (nMidChannels != 0) {
-        channelId += nChannels; // 中间 channel，更新游标
+        channelId += nChannels;
         currentTraffic = 0;
       } else {
-        currentTraffic += cellsLo * elementsPerCell * trafficPerElement; // 第一根 channel，更新当前 channel 已承担的通信工作量
+        currentTraffic += cellsLo * elementsPerCell * trafficPerElement;
       }
 
       if (currentTraffic >= trafficPerChannel && channelId + 1 != nMaxChannels[kind]) {
         channelId += 1;
         currentTraffic = 0;
       }
-      // 遍历每个 channel，创建 proxyOp
+
+      // 同一 task 的各 channel 共用 opCount；最低位 0 标识 collective。
       uint64_t proxyOpId = uint64_t(plan->collOpCount++) << 1 | 0;
+      // 每个 channel 的 batch 记录 funcId，并引用同一份 work（plan 内偏移为 plan->workBytes）。
+      // batch 与所需 ProxyOp 暂存到 wipPlan.channels[c]，供 finishPlan 后续整理。
       for (int c = devWork->channelLo; c <= (int)devWork->channelHi; c++) {
+        // 按 Lo/Mid/Hi 选择模板；loopOffset/channelSize 是本 channel 在任务数据中的字节范围。
         struct ncclProxyOp* proxyOp;
-        if (c == (int)devWork->channelLo) { // 第一根 channel
+        if (c == (int)devWork->channelLo) {
           proxyOp = &proxyOpLo;
           proxyOp->loopOffset = 0;
-          proxyOp->channelSize = countLo * elementSize; // 第一根 channel 的容量
-        } else if (c == (int)devWork->channelHi) { // 最后一根 channel
+          proxyOp->channelSize = countLo * elementSize;
+        } else if (c == (int)devWork->channelHi) {
           proxyOp = &proxyOpHi;
           proxyOp->loopOffset = (countLo + nMidChannels * countMid) * elementSize;
-          proxyOp->channelSize = countHi * elementSize; // 最后一根 channel 的容量
-        } else { // 中间 channel
+          proxyOp->channelSize = countHi * elementSize;
+        } else {
           proxyOp = &proxyOpMid;
           proxyOp->loopOffset = (countLo + (c - devWork->channelLo - 1) * countMid) * elementSize;
-          proxyOp->channelSize = countMid * elementSize; // 中间 channel 的容量
+          proxyOp->channelSize = countMid * elementSize;
         }
-        proxyOp->channelId = c; // 当前 channel 的 ID
+        proxyOp->channelId = c;
         proxyOp->opCount = proxyOpId;
-        proxyOp->task.coll = task; // 当前 Task
-        proxyOp->rank = comm->rank; // 当前 Rank
+        proxyOp->task.coll = task;
+        proxyOp->rank = comm->rank;
         proxyOp->ringAlgo = NULL;
-        //  NET（跨节点网络）零拷贝路径专用的算法
+
+        // ---- (c) 注册缓冲区的 Ring NET 分支：附加按 collective 类型区分的 Ring 算法对象 ----
         if (proxyOp->reg && task->algorithm == NCCL_ALGO_RING && (task->recvNetHandles[c] || task->sendNetHandles[c])) {
           if (task->func == ncclFuncAllGather) {
             proxyOp->ringAlgo =
@@ -1054,28 +1089,30 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
         }
         proxyOp->eActivationMask = task->eActivationMask;
         proxyOp->nChannels = nChannels;
-        // 添加 WorkBatch 到 Kernel Plan
-        // 925  WorkBatch(+已有 DevWorkColl)
-        //→ 「GPU：在 channel C 上跑哪个 func，用户 buffer 哪段、怎么切」
+
         ncclAddWorkBatchToPlan(comm, plan, c, workNode->workType, task->devFuncId, plan->workBytes);
+        // 需要 Proxy 推进时，复制候选 op 到本 channel 的临时队列；实际提交在后续阶段。
         // Coverity reports "proxyOp->connection" as being possibly uninitialized.  It's hard to
         // determine if that's actually true but it's also not clear if that would be an issue.
         // coverity[uninit_use_in_call:FALSE]
-        //  ProxyOp（若 needed）
-        //  → 「Proxy：在连接 X 上发/收多少步、块多大；零拷贝再挂 ringAlgo」
-        NCCLCHECK(ncclAddProxyOpIfNeeded(comm, plan, proxyOp)); // 添加 proxyOp 到 Kernel Plan，如果需要的话
+        NCCLCHECK(ncclAddProxyOpIfNeeded(comm, plan, proxyOp));
       }
     }
-    // 把整个 Kernel Plan 补完整
-    plan->channelMask |= (2ull << devWork->channelHi) - (1ull << devWork->channelLo); // 把所有 channel 都标记为已使用
-    plan->threadPerBlock = std::max(plan->threadPerBlock, task->nWarps * WARP_SIZE); // block 需要多少线程
-    // per-coll cgaClusterSize is applied to the plan. User should use consistent cgaClusterSize in a Group.
-    plan->cgaClusterSize = task->cgaClusterSize; // 当前 Task 的 cgaClusterSize
+
+    // ============ 3. 将本 task 的发射需求汇入 plan，并转移 task/work 的队列归属 ============
+    // channelMask 累加本 task 的活跃区间；threadPerBlock 取已装入任务的最大线程需求。
+    plan->channelMask |= (2ull << devWork->channelHi) - (1ull << devWork->channelLo);
+    plan->threadPerBlock = std::max(plan->threadPerBlock, task->nWarps * WARP_SIZE);
+
+    // 每条 task 都会写入 plan 的 cgaClusterSize，因此同 Group 应使用一致的配置。
+    plan->cgaClusterSize = task->cgaClusterSize;
+    // 尚未锁定 specialized 入口时，按当前 task 的 devFuncId 更新本 plan 的 kernel 入口。
     if (!plan->kernelSpecialized) {
-      plan->kernelFn = ncclDevKernelForFunc[task->devFuncId]; // 当前 Task 的 kernel 函数
+      plan->kernelFn = ncclDevKernelForFunc[task->devFuncId];
       plan->kernelSpecialized = ncclDevKernelForFuncIsSpecialized[task->devFuncId];
     }
-    // Profiler
+
+    // 将 task 的 Group API profiler 句柄关联到当前 plan。
     plan->groupApiEventHandle = task->groupApiEventHandle;
 
     if (comm->rank == 0) {
@@ -1102,16 +1139,20 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
       }
     }
 
+    // 注册资源的清理回调随 task 转交给当前 plan，在 plan 回收时处理。
     for (int i = 0; i < task->nCleanupQueueElts; i++) {
       ncclIntruQueueEnqueue(&plan->cleanupQueue, ncclIntruQueueDequeue(&planner->collCleanupQueue));
     }
-    ncclIntruQueueDequeue(&planner->collTaskQueue); // 从 Task 队列中取出当前 Task
-    ncclIntruQueueDequeue(&planner->collWorkQueue); // 从 Work 队列中取出当前 Work
-    nPlanColls -= 1; // 更新整个 Kernel Plan 的 Task 数
-    planner->nTasksColl -= 1; // 更新整个 Kernel Plan 的 Task 数
-    ncclIntruQueueEnqueue(&plan->collTaskQueue, task); // 把当前 Task 放回 Task 队列，准备下次 Plan
-    ncclIntruQueueEnqueue(&plan->workQueue, workNode); // 把当前 Work 放回 Work 队列，准备下次 Plan
-    plan->workBytes += workNode->size; // 更新整个 Kernel Plan 的通信工作量
+    // planner 待排产队列 → 当前 plan 的任务/work 队列；各 channel 共同引用这份 work。
+    // nPlanColls 减去本轮已排入的候选，nTasksColl 减去 planner 中已排完的任务。
+    ncclIntruQueueDequeue(&planner->collTaskQueue);
+    ncclIntruQueueDequeue(&planner->collWorkQueue);
+    nPlanColls -= 1;
+    planner->nTasksColl -= 1;
+    ncclIntruQueueEnqueue(&plan->collTaskQueue, task);
+    ncclIntruQueueEnqueue(&plan->workQueue, workNode);
+    // 只累加 GPU work 描述字节数，用于存储预算和后续上传；用户数据仍在原缓冲区。
+    plan->workBytes += workNode->size;
   }
   return ncclSuccess;
 }
@@ -1978,33 +2019,42 @@ static ncclResult_t getImplicitOrder(enum ncclImplicitOrder* mode, struct ncclCo
   return ncclSuccess;
 }
 
+// 将本 comm 的待执行任务排成一个或多个 plan，并建立发射前的 stream 依赖。
+// 普通 kernel 路径：task/work 队列 → 按预算分配 channel、分块并生成 batch/proxy-op
+//   → finishPlan 整理参数与队列 → planQueue → stream 依赖及按需 host callback。
+// wipPlan 是当前 plan 的临时排产状态；planQueue 保存已准备好、等待后续发射的 plan。
+// 一个 Group 可产生多个 plan；RMA、Copy Engine、Symmetric 各走专用调度分支。
+// 普通 kernel 的 work 上传和实际发射在后续 uploadWork / ncclLaunchKernel 中完成。
 ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
   ncclResult_t result = ncclSuccess;
   struct ncclKernelPlanner* planner = &comm->planner;
+  // 捕获进 CUDA Graph 的 plan 需保留供重放，并在 graph 析构时安排回收。
   bool persistent = ncclCudaGraphValid(planner->capturingGraph);
   planner->persistent = persistent;
-  // Operations from different plans will not be batched together. A new batch will be created for each new plan that
-  // is used to schedule the ops (see ncclAddWorkBatchToPlan).
-  // For p2p ops, we further guarantee that ops from different epochs will not be batched together (to avoid hangs).
-  // The p2pEpoch value is incremented in scheduleP2pTasksToPlan and its value is carried over from one plan to
-  // another (even if not strictly required)
+  // 每个 plan 独立构建 batch；清空 wipPlan 后，ncclAddWorkBatchToPlan 会从新 batch 开始。
+  // P2P 调度的 epoch/round 游标跨 plan 保留，续接尚未排完的任务。
+  // 启用 P2P_EPOCH_ENABLE 时，不同 epoch 的 P2P 操作也会拆成不同 batch，以避免挂起。
   int nPlans = 0, p2pEpoch = 0, p2pRound = 0;
 
+  // ============ 1. 循环排产，直到各类待执行任务耗尽 ============
   if (planner->nTasksColl + planner->nTasksP2p + planner->nTasksBcast != 0 ||
       !ncclIntruQueueEmpty(&planner->collSymTaskQueue) || !ncclIntruQueueEmpty(&planner->collCeTaskQueue) ||
       planner->nTasksRma != 0) {
     do {
-      memset(&planner->wipPlan, 0, sizeof(planner->wipPlan)); // 创建 Plan
+      // 清空上一轮的临时排产状态；真正的 plan 节点在下面从内存池分配。
+      memset(&planner->wipPlan, 0, sizeof(planner->wipPlan));
 
       struct ncclKernelPlan* plan =
         ncclMemoryPoolAlloc<struct ncclKernelPlan>(&comm->memPool_ncclKernelPlan, &comm->memPermanent);
       plan->comm = comm;
       plan->reclaimer.fn = reclaimPlan;
       plan->persistent = persistent;
-      // finishPlan() promotes ncclDevWorkStorageType[Fifo|Persistent]->Args if the work can fit.
+      // 先选外置 work 存储方式：普通发射用 FIFO，graph plan 用 Persistent。
+      // 若全部 batch/work 能放进 kernel 参数区，finishPlan 会改为 Args；生命周期仍由 persistent 决定。
       plan->workStorageType = persistent ? ncclDevWorkStorageTypePersistent : ncclDevWorkStorageTypeFifo;
       plan->cgaClusterSize = comm->config.cgaClusterSize;
 
+      // ---- (a) 专用调度分支：依次优先处理 RMA、Copy Engine、Symmetric ----
       if (planner->nTasksRma != 0) {
         NCCLCHECKGOTO(scheduleRmaTasksToPlan(comm, plan), result, failure);
         if (plan->isRma && plan->rmaArgs != NULL && plan->rmaArgs->nRmaTasks > 0) {
@@ -2012,34 +2062,34 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
           nPlans += 1;
         }
       } else if (!ncclIntruQueueEmpty(&planner->collCeTaskQueue)) {
+        // CE 调度器内部将 plan 入队，此处只累计 plan 数。
         NCCLCHECKGOTO(scheduleCeCollTaskToPlan(comm, plan), result, failure);
         nPlans += 1;
       } else {
         if (!ncclIntruQueueEmpty(&planner->collSymTaskQueue)) {
           NCCLCHECKGOTO(ncclSymmetricTaskScheduler(comm, &planner->collSymTaskQueue, plan), result, failure);
         } else {
-          // 往 Plan 装任务
+          // ---- (b) 普通 kernel 路径：在参数区与外置 work 存储预算内装入任务 ----
           struct ncclKernelPlanBudget budget;
           budget.inArgsBytes = comm->workArgsBytes - sizeof(struct ncclDevKernelArgs);
-          // Non-persistent kernels fill up at most half of our fifo per kernel.
+          // 外置 work 预算：graph plan 为 1 GiB；普通 plan 最多使用 FIFO 容量的一半。
           budget.outArgsBytes = plan->persistent ? (1 << 30) : comm->workFifoBytes / 2;
 
-          // Drain coll tasks first. This is essential since we partition tasks based
-          // on the work budget and p2p work isn't collective. If we were to drain p2p
-          // first, the place where we cut the kernel could vary by rank which would
-          // cause the "shortest channel first" channel picker to have divergent results.
+          // 先排 collective，再排剩余 Broadcast，最后才排 P2P；一轮装不下就创建下一份 plan。
+          // P2P 数量可因 rank 而异；若先排 P2P，可能使 collective 的预算切分点及 channel 选择在 rank 间分歧。
           if (planner->nTasksColl != 0) {
             NCCLCHECKGOTO(scheduleCollTasksToPlan(comm, plan, &budget), result, failure);
           }
           if (planner->nTasksColl == 0 && planner->nTasksBcast != 0) {
             NCCLCHECKGOTO(ncclScheduleBcastTasksToPlan(comm, plan, &budget), result, failure);
           }
-          // And only drain p2p tasks once colls are depleted.
+          // collective 与 Broadcast 全部耗尽后，才允许 P2P 使用本轮剩余预算。
           if (planner->nTasksColl == 0 && planner->nTasksBcast == 0 && planner->nTasksP2p != 0) {
             NCCLCHECKGOTO(scheduleP2pTasksToPlan(comm, &p2pEpoch, &p2pRound, plan, &budget), result, failure);
           }
         }
-        // 收尾并入队
+        // 普通 plan：将各 channel 的 batch 打包进 kernelArgs，并合并 proxy-op 队列。
+        // Symmetric plan 已由专用调度器准备完毕，finishPlan 对它直接返回。
         finishPlan(comm, plan);
         if (plan->workBytes != 0) {
           ncclIntruQueueEnqueue(&planner->planQueue, plan);
@@ -2050,43 +2100,46 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
              !ncclIntruQueueEmpty(&planner->collSymTaskQueue) || !ncclIntruQueueEmpty(&planner->collCeTaskQueue) ||
              planner->nTasksRma != 0);
 
+    // planQueue 的节点用 plan->next 串联；unlaunchedPlansHead 是后续逐 plan 发射的起点。
+    // [ncclKernelPlan] --next--> [ncclKernelPlan] --next--> nullptr
     struct ncclKernelPlan* planHead = ncclIntruQueueHead(&planner->planQueue);
     planner->unlaunchedPlansHead = planHead;
 
     if (nPlans == 0) return ncclSuccess;
 
+    // ============ 2. 确定发射 stream，并汇合此前的执行依赖 ============
+    // 后续普通 kernel 发射到本 Group 的第一条用户 stream；deviceStream 用于共享执行顺序管理。
     cudaStream_t launchStream = planner->streams->stream;
     cudaStream_t deviceStream, launchOrder;
     bool capturing = ncclCudaGraphValid(planner->capturingGraph);
     bool useLaunchStream = capturing && !ncclGraphStreamOrderingSerialize(comm);
 
     if (useLaunchStream) {
-      // GRAPH_STREAM_ORDERING=0: run kernels on the graph origin (launchStream) without a
-      // secondary captureStream. Serialize graph launches by waiting on serialEvent via
-      // cudaEventWaitExternal, which CUDA allows on the origin stream during capture.
+      // ---- (c) Graph 分支：GRAPH_STREAM_ORDERING=0 时直接使用 launchStream ----
+      // 通过 ExternalWait 等待共享 serialEvent，不另外获取 deviceStream 的 captureStream。
       struct ncclStrongStream* ss = &comm->sharedRes->deviceStream;
       bool firstCapture = !COMPILER_ATOMIC_LOAD(&ss->everCaptured, std::memory_order_relaxed);
       COMPILER_ATOMIC_STORE(&ss->everCaptured, true, std::memory_order_relaxed);
       if (firstCapture) {
-        // Bootstrap: signal serialEvent on the live stream so the first graph's ExternalWait
-        // node can fire immediately. This keeps graph structure identical across all
-        // captures (ExternalWait always present), so cudaGraphExecUpdate succeeds.
+        // 首次捕获先在 liveStream 记录 serialEvent，使首个 ExternalWait 有可等待的事件。
+        // 每次捕获都保留 ExternalWait 节点，以维持 graph 结构一致，便于 cudaGraphExecUpdate。
         CUDACHECKGOTO(cudaEventRecord(ss->serialEvent, ss->liveStream), result, failure);
       }
       CUDACHECKGOTO(cudaStreamWaitEvent(launchStream, ss->serialEvent, cudaEventWaitExternal), result, failure);
       deviceStream = launchStream;
     } else {
+      // 其他情况获取共享 strong stream；其 acquire 与后续 ncclLaunchFinish 的 release 配对。
       NCCLCHECKGOTO(ncclStrongStreamAcquire(planner->capturingGraph, &comm->sharedRes->deviceStream,
                                             /*concurrent=*/false, &deviceStream),
                     result, failure);
     }
 
-    // userStream[0] waits on each userStream[i]...
+    // 第一条用户 stream 等待其他用户 stream 的先前工作：先汇合输入依赖，再执行通信。
     for (struct ncclCudaStreamList* l = planner->streams->next; l != nullptr; l = l->next) {
       CUDACHECKGOTO(cudaEventRecord(comm->sharedRes->scratchEvent, l->stream), result, failure);
       CUDACHECKGOTO(cudaStreamWaitEvent(launchStream, comm->sharedRes->scratchEvent, 0), result, failure);
     }
-    // userStream[0] waits on deviceStream (skip when same to avoid a self-loop in the CUDA graph)
+    // 再接上共享 deviceStream 的先前工作；两者相同时跳过，避免 graph 自环。
     if (deviceStream != launchStream) {
       NCCLCHECKGOTO(ncclStreamWaitStream(launchStream, deviceStream, comm->sharedRes->scratchEvent), result, failure);
     }
@@ -2095,10 +2148,9 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
     cudaError_t status = cudaSuccess;
     NCCLCHECKGOTO(getImplicitOrder(&implicitOrder, comm, capturing), result, failure);
 
+    // ---- (d) 隐式发射顺序分支：接上 launchOrder 依赖；useLaunchStream 时使用 graph origin ----
     if (implicitOrder != ncclImplicitOrderNone) {
-      // userStream[0] waits on per-device (context) launchOrder. Concurrent strong stream access is
-      // required if this is a graph capture, non-captured cannot be concurrent because that would violate
-      // deterministic program order of launches.
+      // 捕获时允许并发获取 strong stream；非捕获时按确定的程序顺序访问。
       bool concurrent = capturing;
       if (useLaunchStream) {
         launchOrder = planner->capturingGraph.origin;
@@ -2112,16 +2164,18 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
       }
     }
 
+    // ============ 3. 按需安排 host callback，提交 Proxy 工作与 profiler 事件 ============
+    // 非捕获发射仍有 graph plan 引用时，检查共享 hostStream 的串行事件是否已完成。
     if (!persistent && comm->sharedRes->persistentRefs) {
       status = CUDACLEARERROR(cudaEventQuery(comm->sharedRes->hostStream.serialEvent));
     }
     if (persistent || ncclCudaLaunchBlocking || status == cudaErrorNotReady) {
-      // We have to launch host tasks to push proxy args. We are careful to only
-      // do this if necessary since host tasks impose a high performance cost in CUDA.
+      // Graph 捕获、CUDA_LAUNCH_BLOCKING 或串行事件未就绪时，使用 stream 上的 host callback。
+      // callback 执行 hostStreamPlanTask，按需上传 proxy-op 并启动 Proxy，同时处理 profiler 事件。
       bool acquired = false;
       cudaStream_t hostStream;
       for (struct ncclKernelPlan* plan = planHead; plan != nullptr; plan = plan->next) {
-        // hasProfilerOps: pure NVL/SHM plans still need the host callback per replay.
+        // 有 Proxy 工作或 profiler 事件才入队回调；无 Proxy 的 plan 也可能需要 graph 重放时的 profiler 回调。
         if (plan->hasProxyOps || plan->hasProfilerOps) {
           if (!acquired) {
             acquired = true;
@@ -2134,7 +2188,7 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
         }
       }
       if (acquired) {
-        // Make to-be-launched kernels dependent on just-launched host stream tasks.
+        // 让后续 kernel 等待上述 host callback，保证所需 Proxy 工作先完成提交。
         NCCLCHECKGOTO(ncclStreamWaitStream(launchStream, hostStream, comm->sharedRes->scratchEvent), result, failure);
         NCCLCHECKGOTO(ncclStrongStreamRelease(planner->capturingGraph, &comm->sharedRes->hostStream,
                                               /*concurrent=*/false),
@@ -2142,6 +2196,8 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
       }
     }
 
+    // ============ 4. 将 persistent plan 的生命周期绑定到 CUDA Graph ============
+    // graph 析构时，persistentDestructor 把 plan 放入 callbackQueue，交由后续回收流程处理。
     if (persistent) {
       comm->sharedRes->persistentRefs += nPlans;
       comm->localPersistentRefs += nPlans;
