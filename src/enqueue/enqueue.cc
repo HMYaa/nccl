@@ -245,7 +245,7 @@ CPU侧分散对象
         ↓
 整理成 GPU 容易解析的连续布局
 
-Args 模式： 
+Args 模式：
 a. 如果东西比较少：
 kernelArgs
 ┌──────────────────────┐
@@ -303,7 +303,7 @@ Header + descriptor
 plan->workQueue                wipChannel[0]
   WorkA                          Proxy A0 (opCount=0)
   WorkB                          Proxy B0 (opCount=2)
-                                     
+
                                wipChannel[1]
                                  Proxy A1 (opCount=0)
                                  Proxy B1 (opCount=2)
@@ -407,7 +407,7 @@ static void finishPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   // 按 channel 顺序扫描每个 channel 的第一个 proxy-op，存储 opCount 到 headIds[c]。
   // GPU：
   // 为了 blockIdx.x 快速找到工作
- 
+
   // CPU Proxy：
   // 为了按照 opCount 顺序提交/推进网络工作
   uint64_t headIds[MAXCHANNELS];
@@ -543,24 +543,17 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
   return ncclSuccess;
 }
 
-// Called once per ncclGroup to organize the user submitted tasks in
-// comm->planner so that they can be peeled off into plans.
-/*1. 分桶 → 按 (func, op, datatype)，不是按算法。
-  2. 拿算法前 → 同桶里差不多大的（<4×）先合着估一次，再 ncclGetAlgoInfo，再写回每条 task。
-  3. 串总队 → 按调度约束四筐拼接：先普通（非 CollNet），同层里再非 NVLS → NVLS，然后才是 CollNet 那侧。口语说「普通 → 不普通」可以，本质是 CollNet ×
-     NVLS，不是 Ring/Tree 各一串。
-
-  签名分桶 →（4×合批）选型写回 → 按 CollNet/NVLS 拼成 collTaskQueue
-
-  再往后还有第二遍（要不要建链等） */
-
-// ncclPrepareTasks = 分组 → 选型 → 写回 → 排成待排产队列（顺带可能标记要建链）。
-
+// 为当前 Group 中本 comm 的 collective 任务准备选型结果和待排产队列：
+//   (func, opDev.op, datatype) 分桶 → 同桶内相近大小任务临时合批选型
+//   → 将选型结果写回每个原 task → 按 CollNet/NVLS 调度标志拼成 collTaskQueue。
+// 合批只汇总选型用的 count/trafficBytes；原 task 和用户数据缓冲区仍各自独立。
+// 这里还尝试 NVLS 缓冲区注册、提前生成 NVLS work，并通过输出参数登记按需建链需求。
+// 后续由 ncclTasksRegAndEnqueue 补齐 work，再由 ncclLaunchPrepare 将任务编排进 plan。
 ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool* needConnect, ncclSimInfo_t* simInfo) {
   struct ncclKernelPlanner* planner = &comm->planner;
   planner->persistent = ncclCudaGraphValid(planner->capturingGraph);
 
-  // Put bcast tasks into collSorter if there's only one bcast peer
+  // ---- (a) Broadcast 分支：只有一个 bcast peer 时，转为普通 collective task 参与后续选型 ----
   if (planner->bcast_info.BcastPeers == 1) {
     while (!ncclIntruQueueEmpty(&planner->peers[planner->bcast_info.minBcastPeer].bcastQueue)) {
       struct ncclTaskBcast* bcastTask =
@@ -593,35 +586,33 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     planner->nTasksBcast = 0;
     planner->bcast_info.BcastPeers = 0;
   }
-  // 按 (func, op, datatype) 分桶
-  // Tasks from the sorter come out ordered size descending.
+  // ============ 1. 按任务签名分桶 ============
+  // sorter 按 trafficBytes 的大小区间近似降序串联任务；取出整条链表后再按签名头插。
   struct ncclTaskColl* task = ncclTaskCollSorterDequeueAll(&planner->collSorter);
-  // Tasks are assembled by (fn,op,ty) size ascending.
+  // tasksByFnOpTy[index] 是对应 (func, opDev.op, datatype) 桶的链表头；桶内近似升序。
   struct ncclTaskColl* tasksByFnOpTy[ncclNumFuncs * ncclNumDevRedOps * ncclNumTypes];
   memset(tasksByFnOpTy, 0, sizeof(tasksByFnOpTy));
-  int fnOpTyIndices[ncclNumFuncs * ncclNumDevRedOps * ncclNumTypes]; // tasksByFnOpTy[index] 就是该 (fn, op, ty) 桶的链表头指针。
+  // 只记录非空桶的下标，后续遍历前 fnOpTyCount 项。
+  int fnOpTyIndices[ncclNumFuncs * ncclNumDevRedOps * ncclNumTypes];
   int fnOpTyCount = 0;
 
-  // Skip symmetric kernels for cross-clique
+  // ---- (b) Symmetric 分支：支持且未跨 clique 时，先分流适用任务；剩余任务走下面的选型 ----
   if (comm->symmetricSupport && !comm->p2pCrossClique) {
     NCCLCHECK(ncclMakeSymmetricTaskList(comm, task, &planner->collSymTaskQueue, &task));
   }
 
-  // Walk the size sorted tasks, binning them by (fn,op,ty).
-  while (task != nullptr) { // 桶头 → A(1 MiB) → B(2 MiB) → C(3 MiB) → D(8 MiB)
+  while (task != nullptr) {
     struct ncclTaskColl* next = task->next;
     int index = ((int)task->func * ncclNumDevRedOps + (int)task->opDev.op) * ncclNumTypes + (int)task->datatype;
-    // Add to set of (fn,op,ty) indices on first occurrence
+    // 首次遇到该签名时，将桶下标登记到非空桶列表。
     if (tasksByFnOpTy[index] == nullptr) fnOpTyIndices[fnOpTyCount++] = index;
-    // Add to LIFO for this (fn,op,ty) ， 头插，配合，sorter 是从大大小的排序，大小依次是 8 → 4 → 1。头插后实现，从大到小的排序。
+    // 头插反转同签名任务的顺序：例如取出 8 → 3 → 2 → 1，桶内得到 1 → 2 → 3 → 8。
     task->next = tasksByFnOpTy[index]; // 新节点指向原桶头
     tasksByFnOpTy[index] = task;       // 桶头改成新节点
-    // Next task
     task = next;
   }
-  //  对相近大小的任务临时合批选型
-  // Walk (fn,op,ty) bins, compute algo and proto etc. Then bin them by their
-  // scheduling constraints (collnet x nvls).
+  // ============ 2. 同桶内临时合批选型，再按调度标志入队 ============
+  // collBins 有 2×2 个调度类别；多个不同算法可落入同一类别，各类别也可能为空。
   struct ncclIntruQueue<struct ncclTaskColl, &ncclTaskColl::next> collBins[2][2] = {};
   for (int cursor = 0; cursor < fnOpTyCount; cursor++) {
     struct ncclTaskColl* aggBeg = tasksByFnOpTy[fnOpTyIndices[cursor]];
@@ -634,25 +625,28 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     // so either be crude our iterate until fixed point, we chose the former.
     int nTasksPerChannel = divUp(comm->planner.nTasksColl, comm->nChannels);
     do {
+      // 选型批次为 [aggBeg, aggEnd)：aggBeg 固定为批首，aggEnd 探测下一候选任务。
       struct ncclTaskColl* aggEnd = aggBeg->next;
+      // agg 是批首 task 的临时副本，只累加统计量供选型；不合并原 task 或其数据缓冲区。
       struct ncclTaskColl agg = *aggBeg;
-      // We aggregate operations that are within 4X size of each other.
+      // 候选 trafficBytes 必须严格小于批首的 4 倍，且批首、候选均未要求 aggIsolate。
+      // 例如 1、2、3、8 可分两批 [1,2,3] 和 [8]；这里的 4 是大小倍数，不是任务数。
       while (aggEnd != nullptr && aggEnd->trafficBytes < 4 * aggBeg->trafficBytes && !aggBeg->aggIsolate &&
              !aggEnd->aggIsolate) {
         agg.count += aggEnd->count;
         agg.trafficBytes += aggEnd->trafficBytes;
         aggEnd = aggEnd->next;
       }
-      // 定算法
+      // 用本批累加后的 count 等信息选出 algorithm、protocol、nMaxChannels 和 nWarps。
+      // 每批独立选型；nMaxChannels 是资源上限，具体 channel 分配留给后续排产。
       NCCLCHECK(ncclGetAlgoInfo(comm, &agg, collNetSupport, nvlsSupport, nTasksPerChannel, simInfo));
       agg.devFuncId = ncclDevFuncId(agg.func, agg.opDev.op, agg.datatype, agg.algorithm, agg.protocol);
 
       int isCollnet = 0, isNvls = 0;
-      // collBins[isCollnet][isNvls]   // 最多 4 条队列
-      // [0][0]  普通（Ring/Tree 等）     ← 典型 AllReduce 在这
-      // [0][1]  只要 NVLS
-      // [1][0]  只要 CollNet
-      // [1][1]  CollNet + NVLS
+      // 将已选算法映射到 collBins[isCollnet][isNvls] 的调度类别：
+      // [0][0] 两个标志均为 0（如 Ring/Tree）；[0][1] 仅 NVLS 标志为 1；
+      // [1][0] 仅 CollNet 标志为 1；[1][1] 两个标志均为 1（如多节点 NVLS）。
+      // 这些标志描述后续调度约束；算法本身仍保存在 task->algorithm 中。
       switch (agg.algorithm) {
       case NCCL_ALGO_NVLS:
       case NCCL_ALGO_NVLS_TREE:
@@ -668,8 +662,8 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
         isCollnet = 1;
         break;
       }
-      // 把选型结果写回原 task
-      // Update the aggregated tasks with the computed values.
+      // 将同一批的选型结果逐项写回原 task，并将每个 task 入队到同一调度类别。
+      // 入队会改写 next，因此先保存后继；aggBeg 最终推进到 aggEnd，作为下一批起点。
       do {
         struct ncclTaskColl* next = aggBeg->next;
         aggBeg->algorithm = agg.algorithm;
@@ -686,29 +680,27 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     } while (aggBeg != nullptr);
   }
 
-  // 拼成 collTaskQueue
-  // Concatenate `collBins[*][*]` together into final list `planner->collTaskQueue`.
-  // Collnet is the outer dimension since that affects how we divide over the
-  // channels.
+  // ============ 3. 拼接待排产队列 ============
+  // 顺序为 [0][0] → [0][1] → [1][0] → [1][1]，使同类任务在 collTaskQueue 中连续。
+  // CollNet 为外层维度，因为它影响后续的 channel 划分。
   for (int isCollnet = 0; isCollnet <= 1; isCollnet++) {
     for (int isNvls = 0; isNvls <= 1; isNvls++) {
       ncclIntruQueueTransfer(&planner->collTaskQueue, &collBins[isCollnet][isNvls]);
     }
   }
-  // 按条件登记连接需求
-  // Walk tasks again to:
-  // 1. Possibly register buffers.
-  // 2. Build ncclDevWorkColl structs.
-  // 3. Bin the work structs according to the number of valid channels they
-  //    may be assigned to {collnet, nvls, standard}
+  // ============ 4. NVLS 注册/work 预处理，并登记按需建链需求 ============
+  // 再遍历 collTaskQueue：尝试 NVLS 注册，依据算法和注册结果标记连接需求。
+  // 此处仅提前生成 NVLS/NVLS_TREE 的 work；其他算法的 work 留给 ncclTasksRegAndEnqueue。
   task = ncclIntruQueueHead(&planner->collTaskQueue);
   while (task != nullptr) {
-    // Build a ncclDevWorkColl[Reg?] struct for each task.
+    // 注册结果写入 task->regBufType；regNeedConnect 表示是否仍需 NVLS 常规缓冲区连接。
     void* regBufSend[NCCL_MAX_LOCAL_RANKS];
     void* regBufRecv[NCCL_MAX_LOCAL_RANKS];
     bool regNeedConnect = true;
     ncclRegisterCollNvlsBuffers(comm, task, regBufSend, regBufRecv, &planner->collCleanupQueue, &regNeedConnect);
 
+    // initAlgoChannels 在此也用于去重登记；置 true 本身不表示连接已经完成。
+    // algoNeedConnect 按算法登记需求，needConnect 通知调用方继续安排建链。
     if (comm->runtimeConn && comm->initAlgoChannels[task->algorithm] == false) {
       if (task->algorithm == NCCL_ALGO_NVLS_TREE && comm->initAlgoChannels[NCCL_ALGO_NVLS] == false &&
           regNeedConnect == true) {
@@ -721,7 +713,7 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
         *needConnect = true;
       }
     }
-    // NVLS/NVLS_TREE 另有特殊 work 处理。
+    // NVLS/NVLS_TREE 的 work 暂存到 tmpCollWorkQueue，供 ncclTasksRegAndEnqueue 依次取用。
     if (task->algorithm == NCCL_ALGO_NVLS_TREE || task->algorithm == NCCL_ALGO_NVLS) {
       struct ncclDevWorkColl devWork = {};
       devWork.sendbuff = (void*)task->sendbuff;
@@ -762,8 +754,7 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     }
     task = task->next;
   }
-  // 检查 runtime connect 需求
-  // Process broadcast tasks for runtimeConn
+  // ---- (c) Broadcast 分支：为仍留在 bcastQueue 中的任务登记 Ring 连接需求 ----
   if (comm->runtimeConn && planner->nTasksBcast > 0) {
     for (int peer = planner->bcast_info.minBcastPeer; peer <= planner->bcast_info.maxBcastPeer; peer++) {
       struct ncclTaskBcast* bcastTask = ncclIntruQueueHead(&planner->peers[peer].bcastQueue);
